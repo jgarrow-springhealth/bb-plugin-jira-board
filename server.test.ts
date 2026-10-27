@@ -145,6 +145,20 @@ describe("Jira Board backend", () => {
     await alone.harness.lifecycle.dispose();
   });
 
+  it("never asks Stack Control when it isn't installed", async () => {
+    const callRpc = vi.fn(async () => {
+      throw new Error("not installed");
+    });
+    const host = createFakePluginHost({
+      pluginId: "jira-board",
+      sdk: { plugins: { callRpc, list: async () => ({ plugins: [{ id: "jira-board", enabled: true }] }) } } as never,
+    });
+    await plugin(host.bb);
+    await expect(host.harness.behavior.callRpc("issue_stacks_get", { key: "CFPL-2743" })).resolves.toEqual({ available: false, stacks: [], launchPath: null });
+    expect(callRpc).not.toHaveBeenCalled();
+    await host.harness.lifecycle.dispose();
+  });
+
   it("refreshes Jira, normalizes issues, caches them, and publishes realtime", async () => {
     const fetchMock = vi
       .fn()

@@ -1784,6 +1784,23 @@ export default async function plugin(bb: BbPluginApi) {
     return { ...snapshot, issues: await withComments(snapshot.issues), sprintIssues: await withComments(snapshot.sprintIssues) };
   }
 
+  // Stack Control is optional: the board never needs it, and shows the Test stack line only when it's installed
+  // and enabled. The check is cached for a minute; when BB can't list plugins it falls back to trying the call,
+  // which fails quietly without the plugin.
+  let stackControlCheck: { at: number; installed: boolean | null } | null = null;
+  async function stackControlInstalled(): Promise<boolean | null> {
+    if (stackControlCheck && Date.now() - stackControlCheck.at < 60_000) return stackControlCheck.installed;
+    let installed: boolean | null;
+    try {
+      const { plugins } = await bb.sdk.plugins.list();
+      installed = plugins.some((plugin) => plugin.id === "stack-control" && plugin.enabled);
+    } catch {
+      installed = null;
+    }
+    stackControlCheck = { at: Date.now(), installed };
+    return installed;
+  }
+
   bb.rpc.register(rpcContract, {
     board_get: async () => {
       const current = await settings.get();
@@ -1806,6 +1823,7 @@ export default async function plugin(bb: BbPluginApi) {
       return formatState(await settings.get(), await readSnapshot());
     },
     issue_stacks_get: async ({ key }) => {
+      if ((await stackControlInstalled()) === false) return { available: false, stacks: [], launchPath: null };
       try {
         const result = await bb.sdk.plugins.callRpc({
           pluginId: "stack-control",
