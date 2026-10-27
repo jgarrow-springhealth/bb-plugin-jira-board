@@ -111,6 +111,40 @@ describe("Jira Board backend", () => {
     await harness.lifecycle.dispose();
   });
 
+  it("asks Stack Control for the ticket's stacks, and works without it", async () => {
+    const reply = {
+      stacks: [
+        {
+          namespace: "ns-1",
+          name: "cfpl-2743",
+          status: "ready",
+          health: "4 of 4 required healthy",
+          expiresAt: null,
+          path: "/plugins/stack-control/stacks/ns-1",
+          why: "for CFPL-2743",
+        },
+      ],
+      launchPath: "/plugins/stack-control/stacks/~launch/CFPL-2743",
+    };
+    const callRpc = vi.fn(async (request: { pluginId: string }) => {
+      if (request.pluginId === "stack-control") return reply;
+      throw new Error("not installed");
+    });
+    const withStackControl = createFakePluginHost({ pluginId: "jira-board", sdk: { plugins: { callRpc } } as never });
+    await plugin(withStackControl.bb);
+    await expect(withStackControl.harness.behavior.callRpc("issue_stacks_get", { key: "CFPL-2743" })).resolves.toEqual({ available: true, ...reply });
+    expect(callRpc).toHaveBeenCalledWith(expect.objectContaining({ pluginId: "stack-control", method: "stacks_for", input: { jiraKey: "CFPL-2743" } }));
+    await withStackControl.harness.lifecycle.dispose();
+
+    const alone = createFakePluginHost({
+      pluginId: "jira-board",
+      sdk: { plugins: { callRpc: async () => Promise.reject(new Error("not installed")) } } as never,
+    });
+    await plugin(alone.bb);
+    await expect(alone.harness.behavior.callRpc("issue_stacks_get", { key: "CFPL-2743" })).resolves.toEqual({ available: false, stacks: [], launchPath: null });
+    await alone.harness.lifecycle.dispose();
+  });
+
   it("refreshes Jira, normalizes issues, caches them, and publishes realtime", async () => {
     const fetchMock = vi
       .fn()

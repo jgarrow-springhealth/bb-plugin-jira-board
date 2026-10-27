@@ -12,6 +12,7 @@ import * as Popover from "@radix-ui/react-popover";
 import * as Tooltip from "@radix-ui/react-tooltip";
 import {
   Markdown,
+  UrlLink,
   definePluginApp,
   experimental_NewThreadComposer as NewThreadComposer,
   useBbNavigate,
@@ -23,6 +24,7 @@ import type {
   BoardState,
   EditOptions,
   ExtraField,
+  IssueStacks,
   IssueUpdate,
   JiraComment,
   JiraIssue,
@@ -1040,6 +1042,64 @@ function PropertyRow({ label, children }: { label: string; children: ReactNode }
   );
 }
 
+function stackTimeLeft(expiresAt: string | null, now = Date.now()) {
+  if (!expiresAt) return null;
+  const hours = (Date.parse(expiresAt) - now) / 3_600_000;
+  if (!Number.isFinite(hours)) return null;
+  if (hours <= 0) return "expired";
+  return hours < 1 ? `${Math.max(1, Math.round(hours * 60))} min left` : `${Math.round(hours)} h left`;
+}
+
+const STACK_TONE_TEXT: Record<string, string> = {
+  good: "text-success",
+  warn: "text-warning-text",
+  bad: "text-destructive",
+  info: "text-[var(--color-timeline-accent,var(--primary))]",
+  neutral: "text-muted-foreground",
+};
+const STACK_TONE_RANK = ["bad", "warn", "info", "good", "neutral"];
+
+/**
+ * One line among the ticket's fields: the ticket's test stack and the one thing to know about it first
+ * (failed, a service down, expiring, behind its PR, scenarios verified, or ready to test), or a link to launch
+ * one. From the Stack Control plugin; hidden without it.
+ */
+function TicketStackRow({ stacks }: { stacks: IssueStacks | null }) {
+  if (!stacks?.available) return null;
+  if (stacks.stacks.length === 0) {
+    return (
+      <PropertyRow label="Test stack">
+        {stacks.launchPath ? (
+          <UrlLink href={stacks.launchPath} className="font-medium text-foreground underline underline-offset-2">
+            Launch one
+          </UrlLink>
+        ) : (
+          <span className="text-muted-foreground">None</span>
+        )}
+      </PropertyRow>
+    );
+  }
+  const ranked = [...stacks.stacks].sort(
+    (a, b) => STACK_TONE_RANK.indexOf(a.headline?.tone ?? a.tone ?? "good") - STACK_TONE_RANK.indexOf(b.headline?.tone ?? b.tone ?? "good"),
+  );
+  const top = ranked[0]!;
+  const tone = top.headline?.tone ?? top.tone ?? "good";
+  const left = stackTimeLeft(top.expiresAt);
+  return (
+    <PropertyRow label="Test stack">
+      <span className={cn("shrink-0 font-medium", STACK_TONE_TEXT[tone])} title={top.headline?.detail}>
+        {top.headline?.text ?? top.healthShort ?? top.status}
+      </span>
+      <span className="text-muted-foreground">·</span>
+      <UrlLink href={top.path} className="min-w-0 truncate font-mono text-[12.5px] text-foreground underline-offset-2 hover:underline" title={`Open ${top.name} in Stacks`}>
+        {top.name}
+      </UrlLink>
+      {left ? <span className="shrink-0 text-xs text-muted-foreground">{left}</span> : null}
+      {stacks.stacks.length > 1 ? <span className="shrink-0 text-xs text-muted-foreground">+{stacks.stacks.length - 1} more</span> : null}
+    </PropertyRow>
+  );
+}
+
 function SectionLabel({ id, children, count }: { id: string; children: ReactNode; count?: number }) {
   return (
     <h3 id={id} className="mb-2 flex items-baseline gap-2 text-[11px] font-semibold uppercase tracking-[0.05em] text-muted-foreground">
@@ -1555,7 +1615,20 @@ function IssueDrawer({
   const [commentsError, setCommentsError] = useState<string | null>(null);
   const [startingWork, setStartingWork] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
+  const [stacks, setStacks] = useState<IssueStacks | null>(null);
   const tags = [...new Set([...summary.labels, ...issue.labels])];
+
+  useEffect(() => {
+    let active = true;
+    setStacks(null);
+    void rpc.call("issue_stacks_get", { key: issue.key }).then(
+      (result) => active && setStacks(result),
+      () => active && setStacks(null),
+    );
+    return () => {
+      active = false;
+    };
+  }, [issue.key, rpc]);
   const { editable, needsToken } = useEditing();
   const edit = useEditOptions(issue, editable && open);
 
@@ -1668,6 +1741,7 @@ function IssueDrawer({
           ) : null}
           <PropertyRow label="Project">{issue.projectName}</PropertyRow>
           <PropertyRow label="Assignee">{issue.assignee ?? "Unassigned"}</PropertyRow>
+          <TicketStackRow stacks={stacks} />
           {tags.length > 0 ? (
             <PropertyRow label="Tags">
               <span className="flex flex-wrap gap-1 py-1">

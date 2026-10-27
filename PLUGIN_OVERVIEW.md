@@ -9,6 +9,7 @@ See all of your assigned Jira work in one place, across projects and epics, with
 - A slide-in details panel with the rendered description and full comment timeline.
 - **Drag to change status:** drag a card to another column to run the matching Jira transition. If several statuses fit, you pick one.
 - **Edit fields:** change status, priority, story points, sprint, and dropdown fields like Capitalized from the details panel. If your workflow won't change a status until Capitalized is set, the board asks for it and tries again.
+- **Test stack**: with the Stack Control plugin installed, the details panel's fields include a Test stack line: what to know first about the ticket's stack (failed, a service down, expiring, behind its PR, scenarios verified, or ready to test), its name and time left, or a link to launch one prefilled with the ticket.
 - **Start working** hands a ticket to an agent. **Chat about this ticket** opens BB's composer so you can ask a question first; nothing is sent until you write your message.
 
 ## How it works

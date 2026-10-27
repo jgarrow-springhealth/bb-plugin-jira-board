@@ -224,6 +224,28 @@ const issueUpdateSchema = z
   );
 export type IssueUpdate = z.infer<typeof issueUpdateSchema>;
 
+/** What the Stack Control plugin knows about stacks for a ticket; `available` is false when it isn't installed. */
+const issueStacksSchema = z.object({
+  available: z.boolean(),
+  stacks: z.array(
+    z.object({
+      namespace: z.string(),
+      name: z.string(),
+      status: z.string(),
+      health: z.string().nullable(),
+      expiresAt: z.string().nullable(),
+      path: z.string(),
+      why: z.string(),
+      tone: z.enum(["neutral", "good", "warn", "bad", "info"]).optional(),
+      healthShort: z.string().optional(),
+      services: z.array(z.object({ name: z.string(), color: z.string() })).optional(),
+      headline: z.object({ text: z.string(), tone: z.enum(["neutral", "good", "warn", "bad", "info"]), detail: z.string() }).optional(),
+    }),
+  ),
+  launchPath: z.string().nullable(),
+});
+export type IssueStacks = z.infer<typeof issueStacksSchema>;
+
 export const rpcContract = defineRpcContract({
   board_get: {
     input: z.null(),
@@ -257,6 +279,11 @@ export const rpcContract = defineRpcContract({
       comments: z.array(commentSchema),
       cached: z.boolean(),
     }),
+  },
+  /** Stack Control stacks made for the ticket, from the Stack Control plugin when it is installed. */
+  issue_stacks_get: {
+    input: z.object({ key: z.string().max(40) }),
+    output: issueStacksSchema,
   },
   /** Hands the ticket to an agent to start working on it. */
   thread_start: {
@@ -1777,6 +1804,19 @@ export default async function plugin(bb: BbPluginApi) {
     issue_update: async (update) => {
       await updateIssue(update);
       return formatState(await settings.get(), await readSnapshot());
+    },
+    issue_stacks_get: async ({ key }) => {
+      try {
+        const result = await bb.sdk.plugins.callRpc({
+          pluginId: "stack-control",
+          method: "stacks_for",
+          input: { jiraKey: key } as never,
+          outputSchema: issueStacksSchema.omit({ available: true }),
+        });
+        return { available: true, ...result };
+      } catch {
+        return { available: false, stacks: [], launchPath: null };
+      }
     },
     issue_comments_get: async ({ key }) => {
       const comments = await readComments(key);
