@@ -19,7 +19,18 @@ import {
   useRpc,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
-import type { BoardState, JiraComment, JiraIssue, JiraSprint, SprintSupport, rpcContract } from "./server";
+import type {
+  BoardState,
+  EditOptions,
+  ExtraField,
+  IssueUpdate,
+  JiraComment,
+  JiraIssue,
+  JiraSprint,
+  JiraTransition,
+  SprintSupport,
+  rpcContract,
+} from "./server";
 import { Button } from "./components/ui/button";
 import {
   Dialog,
@@ -31,6 +42,7 @@ import {
 import { Icon } from "./components/ui/icon";
 import { Input } from "./components/ui/input";
 import { cn } from "./lib/utils";
+import { usePortalScopeProps } from "./lib/portal-scope";
 import {
   DEFAULT_PHASE_RULES,
   PROJECT_PALETTE,
@@ -38,6 +50,7 @@ import {
   hashKey,
   phaseFor,
   type Phase,
+  type PhaseRules,
 } from "./board-model";
 
 type ViewMode = "board" | "sprint" | "epics";
@@ -88,17 +101,71 @@ function tint(color: string, percent: number, base = "transparent"): string {
 }
 
 type BoardContextValue = {
+  rules: PhaseRules;
   phaseOf: (issue: JiraIssue) => Phase;
   colorOf: (project: string) => string;
 };
 
 const BoardContext = createContext<BoardContextValue>({
+  rules: DEFAULT_PHASE_RULES,
   phaseOf: (issue) => phaseFor(issue),
   colorOf: (project) => PROJECT_PALETTE[hashKey(project) % PROJECT_PALETTE.length]!,
 });
 
 function useBoard() {
   return useContext(BoardContext);
+}
+
+// ---- Editing context -------------------------------------------------------
+
+type IssuePatch = Partial<Pick<JiraIssue, "status" | "statusCategory" | "storyPoints" | "priority" | "sprint">>;
+type DragState = { issue: JiraIssue; phase: Phase; reachable: Set<Phase> | null };
+
+type EditingValue = {
+  /** The page may change Jira. */
+  editable: boolean;
+  /** Editing is off only because no API token is set. */
+  needsToken: boolean;
+  saving: ReadonlySet<string>;
+  drag: DragState | null;
+  startDrag: (issue: JiraIssue) => void;
+  endDrag: () => void;
+  dropOn: (phase: Phase) => void;
+  transition: (issue: JiraIssue, transition: JiraTransition) => Promise<boolean>;
+  update: (issue: JiraIssue, update: Omit<IssueUpdate, "key">, optimistic: IssuePatch, success: string) => Promise<boolean>;
+};
+
+const EditingContext = createContext<EditingValue>({
+  editable: false,
+  needsToken: false,
+  saving: new Set(),
+  drag: null,
+  startDrag: () => {},
+  endDrag: () => {},
+  dropOn: () => {},
+  transition: async () => false,
+  update: async () => false,
+});
+
+function useEditing() {
+  return useContext(EditingContext);
+}
+
+function transitionPhase(transition: JiraTransition, rules: PhaseRules): Phase {
+  return phaseFor({ status: transition.toStatus, statusCategory: transition.toStatusCategory }, rules);
+}
+
+/** One transition per target status, skipping the current one; transitions Jira can complete come first. */
+function distinctTargets(transitions: JiraTransition[], currentStatus: string): JiraTransition[] {
+  const seen = new Set<string>();
+  return [...transitions]
+    .sort((a, b) => a.requiredFields.length - b.requiredFields.length)
+    .filter((transition) => {
+      if (transition.toStatus === currentStatus || seen.has(transition.toStatus)) return false;
+      seen.add(transition.toStatus);
+      return true;
+    })
+    .sort((a, b) => transitions.indexOf(a) - transitions.indexOf(b));
 }
 
 /** Jira's browse URL for a key, from the configured site or any cached issue's origin. */
@@ -193,6 +260,12 @@ const GLYPHS = {
     </>
   ),
   play: <path d="M6 3.5v17l14-8.5z" />,
+  pencil: (
+    <>
+      <path d="M21.17 6.81a1 1 0 0 0-3.99-3.99L3.84 16.17a2 2 0 0 0-.5.83l-1.32 4.35a.5.5 0 0 0 .62.62l4.35-1.32a2 2 0 0 0 .83-.5z" />
+      <path d="m15 5 4 4" />
+    </>
+  ),
   chat: (
     <>
       <path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z" />
@@ -295,15 +368,29 @@ function IssueCard({
 }) {
   const summary = splitSummary(issue.summary);
   const color = useBoard().colorOf(issue.project);
+  const { editable, saving, drag, startDrag, endDrag } = useEditing();
+  const busy = saving.has(issue.key);
+  const dragging = drag?.issue.key === issue.key;
   return (
     <button
       type="button"
       onClick={onSelect}
       aria-pressed={selected}
+      aria-busy={busy || undefined}
       data-issue-key={issue.key}
+      draggable={editable && !busy}
+      onDragStart={(event) => {
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", issue.key);
+        startDrag(issue);
+      }}
+      onDragEnd={endDrag}
       className={cn(
-        "group relative flex w-full min-w-0 shrink-0 flex-col gap-2 overflow-hidden rounded-[10px] border bg-card py-2.5 pl-3.5 pr-3 text-left shadow-[0_1px_2px_rgb(16_24_40/0.06)] transition-[border-color,box-shadow] duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        "group relative flex w-full min-w-0 shrink-0 flex-col gap-2 overflow-hidden rounded-[10px] border bg-card py-2.5 pl-3.5 pr-3 text-left shadow-[0_1px_2px_rgb(16_24_40/0.06)] transition-[border-color,box-shadow,opacity] duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
         selected ? "border-transparent" : "border-border hover:shadow-[0_4px_12px_rgb(16_24_40/0.08)]",
+        editable && !busy && "cursor-grab active:cursor-grabbing",
+        dragging && "opacity-40",
+        busy && "opacity-70",
       )}
       style={selected ? { boxShadow: `0 0 0 2px ${color}` } : undefined}
     >
@@ -312,6 +399,11 @@ function IssueCard({
         <ProjectChip project={issue.project} />
         <span className="truncate font-mono text-xs text-muted-foreground">{issue.key}</span>
         <span className="ml-auto flex items-center gap-1.5">
+          {busy ? (
+            <span role="status" aria-label={`Saving ${issue.key}`} className="inline-flex text-muted-foreground">
+              <Glyph name="refresh" className="size-3.5 animate-spin" />
+            </span>
+          ) : null}
           <StoryPoints points={issue.storyPoints} />
           <PriorityIcon priority={issue.priority} />
         </span>
@@ -352,11 +444,43 @@ function PhaseColumn({
 }) {
   const definition = SPRINT_PHASES.find((candidate) => candidate.id === phase)!;
   const color = PHASE_COLORS[phase];
+  const { drag, dropOn } = useEditing();
+  const [over, setOver] = useState(false);
+  const isSource = drag?.phase === phase;
+  const canDrop = drag !== null && !isSource && (drag.reachable === null || drag.reachable.has(phase));
+  useEffect(() => {
+    if (drag === null) setOver(false);
+  }, [drag]);
   return (
     <section
       aria-label={`${definition.label}, ${issues.length} issues`}
-      className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-[14px]"
-      style={{ backgroundColor: tint(color, phase === "queue" ? 10 : phase === "blocked" ? 7 : 9, "var(--background)") }}
+      data-drop-target={canDrop ? (over ? "over" : "allowed") : undefined}
+      onDragOver={(event) => {
+        if (!canDrop) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        if (!over) setOver(true);
+      }}
+      onDragLeave={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOver(false);
+      }}
+      onDrop={(event) => {
+        event.preventDefault();
+        setOver(false);
+        if (canDrop) dropOn(phase);
+      }}
+      className={cn(
+        "flex min-h-0 min-w-0 flex-col overflow-hidden rounded-[14px] transition-[opacity,box-shadow] duration-150",
+        drag !== null && !isSource && !canDrop && "opacity-45",
+      )}
+      style={{
+        backgroundColor: tint(
+          color,
+          over ? 22 : phase === "queue" ? 10 : phase === "blocked" ? 7 : 9,
+          "var(--background)",
+        ),
+        ...(canDrop ? { boxShadow: `inset 0 0 0 ${over ? 2 : 1.5}px ${tint(color, over ? 80 : 40)}` } : {}),
+      }}
     >
       <header className="flex shrink-0 items-center gap-2 px-3.5 pb-2.5 pt-3">
         <PhaseDot phase={phase} />
@@ -373,7 +497,7 @@ function PhaseColumn({
       </header>
       <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-2.5 pb-3 pt-0.5">
         {issues.length === 0 ? (
-          <p className="px-1.5 py-2 text-xs text-muted-foreground">Nothing here.</p>
+          <p className="px-1.5 py-2 text-xs text-muted-foreground">{canDrop ? "Drop to move here." : "Nothing here."}</p>
         ) : (
           issues.map((issue) => (
             <IssueCard
@@ -1005,6 +1129,412 @@ function ChatDialog({
   );
 }
 
+// ---- Field editors ------------------------------------------------------------
+
+type Choice = { id: string; text: string; leading?: ReactNode; hint?: string; selected?: boolean };
+
+/** A property value that opens a short list of choices when Jira allows changing it. */
+function ChoiceMenu({
+  label,
+  value,
+  choices,
+  busy,
+  emptyText,
+  onSelect,
+}: {
+  label: string;
+  value: ReactNode;
+  /** null while the choices load. */
+  choices: Choice[] | null;
+  busy: boolean;
+  emptyText: string;
+  onSelect: (id: string) => void;
+}) {
+  const loading = choices === null;
+  const portalScope = usePortalScopeProps();
+  return (
+    <Popover.Root>
+      <Popover.Trigger asChild>
+        <button
+          type="button"
+          aria-label={`Change ${label}`}
+          disabled={loading || busy}
+          className="-mx-1.5 inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-md px-1.5 py-0.5 text-left text-[13px] transition-colors hover:bg-state-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default disabled:hover:bg-transparent"
+        >
+          {value}
+          {busy || loading ? (
+            <Glyph name="refresh" className={cn("size-3 shrink-0 text-muted-foreground", busy && "animate-spin", loading && "opacity-40")} />
+          ) : (
+            <Icon name="ChevronDown" className="size-3 shrink-0 text-muted-foreground" />
+          )}
+        </button>
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Content
+          {...portalScope}
+          sideOffset={4}
+          align="start"
+          aria-label={`${label} choices`}
+          className="z-50 max-h-80 min-w-56 max-w-80 overflow-y-auto rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md"
+        >
+          {choices === null || choices.length === 0 ? (
+            <p className="px-2 py-1.5 text-xs text-muted-foreground">{emptyText}</p>
+          ) : (
+            choices.map((choice) => (
+              <Popover.Close asChild key={choice.id}>
+                <button
+                  type="button"
+                  aria-current={choice.selected ? "true" : undefined}
+                  onClick={() => {
+                    if (!choice.selected) onSelect(choice.id);
+                  }}
+                  className={cn(
+                    "flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[13px] hover:bg-state-hover focus-visible:bg-state-hover focus-visible:outline-none",
+                    choice.selected && "bg-state-active",
+                  )}
+                >
+                  {choice.leading}
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate">{choice.text}</span>
+                    {choice.hint ? <span className="block truncate text-[11px] text-muted-foreground">{choice.hint}</span> : null}
+                  </span>
+                  {choice.selected ? <Icon name="Check" className="size-3.5 shrink-0 text-muted-foreground" /> : null}
+                </button>
+              </Popover.Close>
+            ))
+          )}
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
+  );
+}
+
+const POINT_PRESETS = [1, 2, 3, 5, 8, 13];
+
+function StoryPointsEditor({
+  issue,
+  busy,
+  onSave,
+}: {
+  issue: JiraIssue;
+  busy: boolean;
+  onSave: (points: number | null) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [invalid, setInvalid] = useState(false);
+  const current = issue.storyPoints ?? null;
+  const portalScope = usePortalScopeProps();
+
+  useEffect(() => {
+    if (open) {
+      setDraft(current === null ? "" : formatPoints(current));
+      setInvalid(false);
+    }
+  }, [open, current]);
+
+  const save = (points: number | null) => {
+    setOpen(false);
+    if (points !== current) onSave(points);
+  };
+  const submit = () => {
+    const text = draft.trim();
+    if (text === "") return save(null);
+    const points = Number(text);
+    if (!Number.isFinite(points) || points < 0 || points > 1000) {
+      setInvalid(true);
+      return;
+    }
+    save(points);
+  };
+
+  return (
+    <Popover.Root open={open} onOpenChange={setOpen}>
+      <Popover.Trigger asChild>
+        <button
+          type="button"
+          aria-label="Change story points"
+          disabled={busy}
+          className="-mx-1.5 inline-flex items-center gap-1.5 rounded-md px-1.5 py-0.5 text-[13px] transition-colors hover:bg-state-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default disabled:hover:bg-transparent"
+        >
+          {current === null ? <span className="text-muted-foreground">Not estimated</span> : formatPoints(current)}
+          {busy ? (
+            <Glyph name="refresh" className="size-3 animate-spin text-muted-foreground" />
+          ) : (
+            <Glyph name="pencil" className="size-3 text-muted-foreground opacity-60" />
+          )}
+        </button>
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Content
+          {...portalScope}
+          sideOffset={4}
+          align="start"
+          aria-label="Story points"
+          className="z-50 w-64 rounded-lg border border-border bg-popover p-2.5 text-popover-foreground shadow-md"
+        >
+          <div className="flex flex-wrap gap-1" role="group" aria-label="Common estimates">
+            {POINT_PRESETS.map((points) => (
+              <button
+                key={points}
+                type="button"
+                aria-pressed={points === current}
+                onClick={() => save(points)}
+                className={cn(
+                  "grid h-7 min-w-8 place-items-center rounded-md border px-2 text-xs font-semibold tabular-nums transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                  points === current
+                    ? "border-transparent bg-foreground text-background"
+                    : "border-border hover:bg-state-hover",
+                )}
+              >
+                {points}
+              </button>
+            ))}
+          </div>
+          <form
+            className="mt-2.5 flex items-center gap-1.5"
+            onSubmit={(event) => {
+              event.preventDefault();
+              submit();
+            }}
+          >
+            <Input
+              type="number"
+              inputMode="decimal"
+              min={0}
+              max={1000}
+              step="any"
+              value={draft}
+              autoFocus
+              aria-label="Story points value"
+              aria-invalid={invalid || undefined}
+              placeholder="Points"
+              onChange={(event) => {
+                setDraft(event.target.value);
+                setInvalid(false);
+              }}
+              className="h-7 flex-1 text-[13px]"
+            />
+            <Button type="submit" size="sm" className="h-7 px-2.5">
+              Save
+            </Button>
+          </form>
+          {invalid ? <p className="mt-1.5 text-[11px] text-destructive">Enter a number from 0 to 1000.</p> : null}
+          {current !== null ? (
+            <button
+              type="button"
+              onClick={() => save(null)}
+              className="mt-2 text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+            >
+              Clear estimate
+            </button>
+          ) : null}
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
+  );
+}
+
+/** The drawer's edit options, reloaded after each change to the issue. */
+function useEditOptions(issue: JiraIssue, enabled: boolean) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [loaded, setLoaded] = useState<{ key: string; options: EditOptions } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!enabled) return;
+    let active = true;
+    setError(null);
+    void rpc.call("issue_edit_options_get", { key: issue.key }).then(
+      (options) => {
+        if (active) setLoaded({ key: issue.key, options });
+      },
+      (cause) => {
+        if (active) setError(cause instanceof Error ? cause.message : String(cause));
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, [enabled, issue.key, issue.status, issue.updatedAt, rpc]);
+  return { options: enabled && loaded?.key === issue.key ? loaded.options : null, error: enabled ? error : null };
+}
+
+/** One extra single-select field, showing the chosen value until fresh options arrive. */
+function ExtraFieldRow({ issue, field }: { issue: JiraIssue; field: ExtraField }) {
+  const { saving, update } = useEditing();
+  const [pending, setPending] = useState<string | null | undefined>(undefined);
+  useEffect(() => setPending(undefined), [field.value]);
+  const value = pending === undefined ? field.value : pending;
+  const label = field.options.find((option) => option.id === value)?.name ?? null;
+  return (
+    <PropertyRow label={field.name}>
+      <ChoiceMenu
+        label={field.name}
+        value={<span className={cn("truncate", label === null && "text-muted-foreground")}>{label ?? "None"}</span>}
+        choices={[
+          ...(field.required ? [] : [{ id: "", text: "None", selected: value === null }]),
+          ...field.options.map((option) => ({ id: option.id, text: option.name, selected: option.id === value })),
+        ]}
+        busy={saving.has(issue.key)}
+        emptyText="Jira offers no options for this field."
+        onSelect={(id) => {
+          const optionId = id === "" ? null : id;
+          const name = field.options.find((option) => option.id === optionId)?.name;
+          setPending(optionId);
+          void update(
+            issue,
+            { fields: { [field.id]: optionId } },
+            {},
+            name === undefined ? `Cleared ${field.name} on ${issue.key}` : `${field.name} set to ${name} on ${issue.key}`,
+          ).then((saved) => {
+            if (!saved) setPending(undefined);
+          });
+        }}
+      />
+    </PropertyRow>
+  );
+}
+
+function EditableProperties({ issue, options }: { issue: JiraIssue; options: EditOptions | null }) {
+  const { saving, transition, update } = useEditing();
+  const { rules } = useBoard();
+  const busy = saving.has(issue.key);
+
+  const statusChoices =
+    options === null
+      ? null
+      : distinctTargets(options.transitions, issue.status).map<Choice>((target) => ({
+          id: target.id,
+          text: target.toStatus,
+          leading: <PhaseDot phase={transitionPhase(target, rules)} />,
+          hint:
+            target.requiredFields.length > 0
+              ? `Needs ${target.requiredFields.join(", ")} in Jira`
+              : target.name.toLowerCase() !== target.toStatus.toLowerCase()
+                ? target.name
+                : undefined,
+        }));
+
+  const sprint = options?.sprint;
+  const currentSprint = sprint?.options.find((candidate) => candidate.id === sprint.currentId) ?? null;
+  const sprintChoices: Choice[] | null =
+    sprint === undefined
+      ? null
+      : [
+          { id: "backlog", text: "Backlog", hint: "Not in a sprint", selected: sprint.currentId === null },
+          ...sprint.options.map((candidate) => ({
+            id: candidate.id,
+            text: candidate.name,
+            hint: [candidate.state === "active" ? "Active" : "Future", candidate.board].filter(Boolean).join(" · "),
+            selected: candidate.id === sprint.currentId,
+          })),
+        ];
+
+  return (
+    <>
+      <PropertyRow label="Status">
+        <ChoiceMenu
+          label="status"
+          value={<StatusChip issue={issue} />}
+          choices={statusChoices}
+          busy={busy}
+          emptyText="Jira's workflow has no transitions from this status."
+          onSelect={(id) => {
+            const target = options?.transitions.find((candidate) => candidate.id === id);
+            if (target !== undefined) void transition(issue, target);
+          }}
+        />
+      </PropertyRow>
+      <PropertyRow label="Priority">
+        {options !== null && !options.priority.editable ? (
+          <>
+            <PriorityIcon priority={issue.priority} />
+            {issue.priority}
+          </>
+        ) : (
+          <ChoiceMenu
+            label="priority"
+            value={
+              <>
+                <PriorityIcon priority={issue.priority} />
+                {issue.priority}
+              </>
+            }
+            choices={
+              options?.priority.options.map((priority) => ({
+                id: priority.id,
+                text: priority.name,
+                leading: <span className="inline-flex w-4 justify-center"><PriorityIcon priority={priority.name} /></span>,
+                selected: priority.name === issue.priority,
+              })) ?? null
+            }
+            busy={busy}
+            emptyText="No priorities are available."
+            onSelect={(id) => {
+              const name = options?.priority.options.find((priority) => priority.id === id)?.name ?? issue.priority;
+              void update(issue, { priorityId: id }, { priority: name }, `${issue.key} priority set to ${name}`);
+            }}
+          />
+        )}
+      </PropertyRow>
+      <PropertyRow label="Story points">
+        {options === null || options.storyPoints.editable ? (
+          <StoryPointsEditor
+            issue={issue}
+            busy={busy || options === null}
+            onSave={(points) =>
+              void update(
+                issue,
+                { storyPoints: points },
+                { storyPoints: points },
+                points === null ? `Cleared the estimate on ${issue.key}` : `${issue.key} estimated at ${pointsLabel(points)}`,
+              )
+            }
+          />
+        ) : issue.storyPoints === null || issue.storyPoints === undefined ? (
+          <span className="text-muted-foreground" title="Story points aren't on this issue's edit screen in Jira.">
+            Not estimated
+          </span>
+        ) : (
+          formatPoints(issue.storyPoints)
+        )}
+      </PropertyRow>
+      {(options?.fields ?? []).map((field) => <ExtraFieldRow key={field.id} issue={issue} field={field} />)}
+      <PropertyRow label="Sprint">
+        {sprint !== undefined && !sprint.editable ? (
+          issue.sprint?.name ?? <span className="text-muted-foreground">None</span>
+        ) : (
+          <ChoiceMenu
+            label="sprint"
+            value={
+              <span className={cn("truncate", currentSprint === null && !issue.sprint && "text-muted-foreground")}>
+                {currentSprint?.name ?? issue.sprint?.name ?? "Backlog"}
+              </span>
+            }
+            choices={sprintChoices}
+            busy={busy}
+            emptyText="No open sprints were found for this project."
+            onSelect={(id) => {
+              const chosen = sprint?.options.find((candidate) => candidate.id === id) ?? null;
+              void update(
+                issue,
+                { sprintId: chosen === null ? null : chosen.id },
+                {
+                  sprint:
+                    chosen?.state === "active"
+                      ? { id: chosen.id, name: chosen.name, goal: null, startDate: null, endDate: null }
+                      : null,
+                },
+                chosen === null ? `Moved ${issue.key} to the backlog` : `Moved ${issue.key} to ${chosen.name}`,
+              );
+            }}
+          />
+        )}
+      </PropertyRow>
+    </>
+  );
+}
+
 function IssueDrawer({
   issue,
   open,
@@ -1026,6 +1556,8 @@ function IssueDrawer({
   const [startingWork, setStartingWork] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const tags = [...new Set([...summary.labels, ...issue.labels])];
+  const { editable, needsToken } = useEditing();
+  const edit = useEditOptions(issue, editable && open);
 
   useEffect(() => {
     if (open) closeRef.current?.focus({ preventScroll: true });
@@ -1106,16 +1638,22 @@ function IssueDrawer({
 
       <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-6 pt-4">
         <dl className="m-0 mb-5 flex flex-col gap-1">
-          <PropertyRow label="Status"><StatusChip issue={issue} /></PropertyRow>
-          <PropertyRow label="Priority"><PriorityIcon priority={issue.priority} />{issue.priority}</PropertyRow>
-          <PropertyRow label="Story points">
-            {issue.storyPoints === null || issue.storyPoints === undefined ? (
-              <span className="text-muted-foreground">Not estimated</span>
-            ) : (
-              formatPoints(issue.storyPoints)
-            )}
-          </PropertyRow>
-          {issue.sprint ? <PropertyRow label="Sprint">{issue.sprint.name}</PropertyRow> : null}
+          {editable ? (
+            <EditableProperties issue={issue} options={edit.options} />
+          ) : (
+            <>
+              <PropertyRow label="Status"><StatusChip issue={issue} /></PropertyRow>
+              <PropertyRow label="Priority"><PriorityIcon priority={issue.priority} />{issue.priority}</PropertyRow>
+              <PropertyRow label="Story points">
+                {issue.storyPoints === null || issue.storyPoints === undefined ? (
+                  <span className="text-muted-foreground">Not estimated</span>
+                ) : (
+                  formatPoints(issue.storyPoints)
+                )}
+              </PropertyRow>
+              {issue.sprint ? <PropertyRow label="Sprint">{issue.sprint.name}</PropertyRow> : null}
+            </>
+          )}
           {issue.parentSummary ? (
             <PropertyRow label="Epic">
               <button
@@ -1141,6 +1679,14 @@ function IssueDrawer({
           ) : null}
           <PropertyRow label="Updated">{shortDate(issue.updatedAt)} · {relativeTime(issue.updatedAt)}</PropertyRow>
         </dl>
+        {edit.error !== null ? (
+          <p role="alert" className="-mt-3 mb-5 text-xs text-destructive">Couldn't load what can be changed: {edit.error}</p>
+        ) : null}
+        {!editable && needsToken ? (
+          <p className="-mt-3 mb-5 text-xs text-muted-foreground">
+            To change status, points, priority, or sprint here, add a Jira API token under Settings → Plugins → Jira Board.
+          </p>
+        ) : null}
 
         <section aria-labelledby="description-heading" className="mb-6">
           <SectionLabel id="description-heading">Description</SectionLabel>
@@ -1227,6 +1773,87 @@ function IssueDrawer({
 
 // ---- Page -------------------------------------------------------------------
 
+/** Asks for an extra field Jira's workflow requires, then retries the status change. */
+function RequiredFieldDialog({
+  prompt,
+  onClose,
+  onChoose,
+}: {
+  prompt: { issue: JiraIssue; target: JiraTransition; field: ExtraField; message: string } | null;
+  onClose: () => void;
+  onChoose: (prompt: { issue: JiraIssue; target: JiraTransition; field: ExtraField; message: string }, optionId: string) => void;
+}) {
+  return (
+    <Dialog open={prompt !== null} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-w-sm gap-3">
+        <DialogHeader>
+          <DialogTitle>Set {prompt?.field.name} first</DialogTitle>
+          <DialogDescription>
+            Jira needs {prompt?.field.name} before {prompt?.issue.key} can move to {prompt?.target.toStatus}. Pick a value
+            and the move will run again.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex flex-col gap-1" role="group" aria-label={`${prompt?.field.name ?? "Field"} options`}>
+          {prompt?.field.options.map((option) => (
+            <button
+              key={option.id}
+              type="button"
+              onClick={() => onChoose(prompt, option.id)}
+              className="rounded-lg border border-border px-3 py-2 text-left text-[13px] font-medium hover:bg-state-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              {option.name}
+            </button>
+          ))}
+        </div>
+        <p className="text-[11px] text-muted-foreground">Jira said: {prompt?.message}</p>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** Asks which status to use when a column holds several statuses the ticket can move to. */
+function TransitionChoiceDialog({
+  choice,
+  onClose,
+  onChoose,
+}: {
+  choice: { issue: JiraIssue; phase: Phase; targets: JiraTransition[] } | null;
+  onClose: () => void;
+  onChoose: (issue: JiraIssue, target: JiraTransition) => void;
+}) {
+  const label = SPRINT_PHASES.find((candidate) => candidate.id === choice?.phase)?.label ?? "";
+  return (
+    <Dialog open={choice !== null} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-w-sm gap-3">
+        <DialogHeader>
+          <DialogTitle>Move {choice?.issue.key} to {label}</DialogTitle>
+          <DialogDescription>Pick the Jira status. It's {choice?.issue.status} now.</DialogDescription>
+        </DialogHeader>
+        <div className="flex flex-col gap-1" role="group" aria-label="Statuses">
+          {choice?.targets.map((target) => (
+            <button
+              key={target.id}
+              type="button"
+              onClick={() => onChoose(choice.issue, target)}
+              className="flex items-center gap-2.5 rounded-lg border border-border px-3 py-2 text-left text-[13px] hover:bg-state-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <PhaseDot phase={choice.phase} />
+              <span className="min-w-0 flex-1">
+                <span className="block font-medium">{target.toStatus}</span>
+                {target.requiredFields.length > 0 ? (
+                  <span className="block text-[11px] text-muted-foreground">Needs {target.requiredFields.join(", ")} in Jira</span>
+                ) : target.name.toLowerCase() !== target.toStatus.toLowerCase() ? (
+                  <span className="block text-[11px] text-muted-foreground">{target.name}</span>
+                ) : null}
+              </span>
+            </button>
+          ))}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function BoardSkeleton() {
   return (
     <div className="flex h-full flex-col gap-4 px-6 py-5" aria-label="Loading Jira issues">
@@ -1272,6 +1899,17 @@ function JiraBoardPage() {
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [drawerKey, setDrawerKey] = useState<string | null>(null);
   const [epicId, setEpicId] = useState<string | null>(null);
+  const [overrides, setOverrides] = useState<Record<string, IssuePatch>>({});
+  const [saving, setSaving] = useState<ReadonlySet<string>>(() => new Set());
+  const [drag, setDrag] = useState<DragState | null>(null);
+  const [choice, setChoice] = useState<{ issue: JiraIssue; phase: Phase; targets: JiraTransition[] } | null>(null);
+  const [fieldPrompt, setFieldPrompt] = useState<{
+    issue: JiraIssue;
+    target: JiraTransition;
+    field: ExtraField;
+    message: string;
+  } | null>(null);
+  const transitionCache = useRef(new Map<string, Promise<JiraTransition[]>>());
 
   const setHiddenProjects = useCallback((next: Set<string>) => {
     setHiddenProjectsState(next);
@@ -1313,8 +1951,13 @@ function JiraBoardPage() {
     }
   }, [rpc]);
 
-  const allIssues = state?.snapshot?.issues ?? [];
-  const allSprintIssues = state?.snapshot?.sprintIssues ?? [];
+  const withOverrides = useCallback(
+    (issues: JiraIssue[] | undefined) =>
+      (issues ?? []).map((issue) => (overrides[issue.key] === undefined ? issue : { ...issue, ...overrides[issue.key] })),
+    [overrides],
+  );
+  const allIssues = useMemo(() => withOverrides(state?.snapshot?.issues), [state, withOverrides]);
+  const allSprintIssues = useMemo(() => withOverrides(state?.snapshot?.sprintIssues), [state, withOverrides]);
   const sprintSupport: SprintSupport = state?.snapshot?.sprints ?? "unknown";
   const applyFilters = useCallback(
     (issues: JiraIssue[]) => {
@@ -1361,11 +2004,167 @@ function JiraBoardPage() {
       pinnedColors ?? {},
     );
     return {
+      rules,
       phaseOf: (issue) => phaseFor(issue, rules),
       colorOf: (project) => colors[project] ?? PROJECT_PALETTE[hashKey(project) % PROJECT_PALETTE.length]!,
     };
   }, [knownIssues, phaseRules, pinnedColors]);
   const blockedCount = visibleIssues.filter((issue) => board.phaseOf(issue) === "blocked").length;
+
+  // ---- Editing ----
+
+  const loadTransitions = useCallback(
+    (issue: JiraIssue) => {
+      const cacheKey = `${issue.key}|${issue.status}`;
+      let transitions = transitionCache.current.get(cacheKey);
+      if (transitions === undefined) {
+        transitions = rpc.call("issue_transitions_get", { key: issue.key }).then((result) => result.transitions);
+        transitionCache.current.set(cacheKey, transitions);
+        transitions.catch(() => transitionCache.current.delete(cacheKey));
+      }
+      return transitions;
+    },
+    [rpc],
+  );
+
+  /** Applies the change locally right away, then replaces it with Jira's result or rolls it back. */
+  const write = useCallback(
+    async (
+      issue: JiraIssue,
+      optimistic: IssuePatch,
+      call: () => Promise<BoardState>,
+      success: string,
+      /** Handles a refusal itself (returns true) instead of showing the error. */
+      recover?: (message: string) => Promise<boolean>,
+    ) => {
+      setOverrides((current) => ({ ...current, [issue.key]: { ...current[issue.key], ...optimistic } }));
+      setSaving((current) => new Set(current).add(issue.key));
+      try {
+        setState(await call());
+        toast.success(success);
+        return true;
+      } catch (cause) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        if (!(await recover?.(message).catch(() => false))) toast.error(`Couldn't update ${issue.key}: ${message}`);
+        return false;
+      } finally {
+        setOverrides(({ [issue.key]: _done, ...rest }) => rest);
+        setSaving((current) => {
+          const next = new Set(current);
+          next.delete(issue.key);
+          return next;
+        });
+      }
+    },
+    [rpc],
+  );
+
+  const transition = useCallback(
+    async (issue: JiraIssue, target: JiraTransition) => {
+      if (target.requiredFields.length > 0) {
+        toast.error(`Moving ${issue.key} to ${target.toStatus} needs ${target.requiredFields.join(", ")}. Finish it in Jira.`, {
+          action: { label: "Open in Jira", onClick: () => void navigate.openUrl(issue.url) },
+        });
+        return false;
+      }
+      return write(
+        issue,
+        { status: target.toStatus, statusCategory: target.toStatusCategory },
+        () => rpc.call("issue_transition", { key: issue.key, transitionId: target.id }),
+        `${issue.key} moved to ${target.toStatus}`,
+        // When Jira's workflow needs an extra field that is still empty, ask for it.
+        async (message) => {
+          const options = await rpc.call("issue_edit_options_get", { key: issue.key });
+          const lower = message.toLowerCase();
+          const field = (options.fields ?? []).find(
+            (candidate) =>
+              candidate.value === null &&
+              (lower.includes(candidate.name.toLowerCase()) || lower.includes(candidate.id.toLowerCase())),
+          );
+          if (field === undefined) return false;
+          setFieldPrompt({ issue, target, field, message });
+          return true;
+        },
+      );
+    },
+    [navigate, rpc, write],
+  );
+
+  const update = useCallback(
+    (issue: JiraIssue, change: Omit<IssueUpdate, "key">, optimistic: IssuePatch, success: string) => {
+      // Reuse a cached copy of the sprint so its dates and goal stay on screen.
+      const sprint = optimistic.sprint;
+      const known = sprint ? knownIssues.find((candidate) => candidate.sprint?.id === sprint.id)?.sprint : undefined;
+      return write(
+        issue,
+        known ? { ...optimistic, sprint: known } : optimistic,
+        () => rpc.call("issue_update", { key: issue.key, ...change }),
+        success,
+      );
+    },
+    [knownIssues, rpc, write],
+  );
+
+  const startDrag = useCallback(
+    (issue: JiraIssue) => {
+      setDrag({ issue, phase: board.phaseOf(issue), reachable: null });
+      loadTransitions(issue).then(
+        (transitions) => {
+          const reachable = new Set(
+            distinctTargets(transitions, issue.status).map((target) => transitionPhase(target, board.rules)),
+          );
+          setDrag((current) => (current?.issue.key === issue.key ? { ...current, reachable } : current));
+        },
+        () => {
+          // Leave every column open; the drop reports the error.
+        },
+      );
+    },
+    [board, loadTransitions],
+  );
+  const endDrag = useCallback(() => setDrag(null), []);
+
+  const dropOn = useCallback(
+    (phase: Phase) => {
+      const current = drag;
+      setDrag(null);
+      if (current === null) return;
+      const { issue } = current;
+      const label = SPRINT_PHASES.find((candidate) => candidate.id === phase)?.label ?? phase;
+      void loadTransitions(issue).then(
+        (transitions) => {
+          const targets = distinctTargets(transitions, issue.status).filter(
+            (target) => transitionPhase(target, board.rules) === phase,
+          );
+          if (targets.length === 0) {
+            toast.error(`Jira's workflow has no way to move ${issue.key} from ${issue.status} to ${label}.`);
+          } else if (targets.length === 1) {
+            void transition(issue, targets[0]!);
+          } else {
+            setChoice({ issue, phase, targets });
+          }
+        },
+        (cause) => toast.error(`Couldn't load ${issue.key}'s workflow: ${cause instanceof Error ? cause.message : String(cause)}`),
+      );
+    },
+    [board, drag, loadTransitions, transition],
+  );
+
+  const editable = state?.editable ?? false;
+  const editing = useMemo<EditingValue>(
+    () => ({
+      editable,
+      needsToken: state !== null && !state.configured,
+      saving,
+      drag,
+      startDrag,
+      endDrag,
+      dropOn,
+      transition,
+      update,
+    }),
+    [drag, dropOn, editable, endDrag, saving, startDrag, state, transition, update],
+  );
 
   const closeDrawer = useCallback(() => {
     if (selectedKey === null) return;
@@ -1465,6 +2264,7 @@ function JiraBoardPage() {
 
   return (
     <BoardContext.Provider value={board}>
+    <EditingContext.Provider value={editing}>
     <div className="relative flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-background">
       <header className="flex shrink-0 items-center gap-4 px-6 pb-3 pt-5">
         <div className="min-w-0">
@@ -1589,7 +2389,31 @@ function JiraBoardPage() {
           onOpenEpic={openEpic}
         />
       ) : null}
+      <RequiredFieldDialog
+        prompt={fieldPrompt}
+        onClose={() => setFieldPrompt(null)}
+        onChoose={async (prompt, optionId) => {
+          setFieldPrompt(null);
+          const option = prompt.field.options.find((candidate) => candidate.id === optionId);
+          const saved = await update(
+            prompt.issue,
+            { fields: { [prompt.field.id]: optionId } },
+            {},
+            `${prompt.field.name} set to ${option?.name ?? "a value"} on ${prompt.issue.key}`,
+          );
+          if (saved) await transition(prompt.issue, prompt.target);
+        }}
+      />
+      <TransitionChoiceDialog
+        choice={choice}
+        onClose={() => setChoice(null)}
+        onChoose={(issue, target) => {
+          setChoice(null);
+          void transition(issue, target);
+        }}
+      />
     </div>
+    </EditingContext.Provider>
     </BoardContext.Provider>
   );
 }

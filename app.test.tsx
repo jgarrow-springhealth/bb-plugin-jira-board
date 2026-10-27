@@ -378,3 +378,216 @@ describe("board helpers", () => {
     ).toBe("blocked");
   });
 });
+
+describe("Editing Jira from the board", () => {
+  const editableState = (issues: Array<typeof issue>) => ({ ...boardState(issues), editable: true });
+  const dataTransfer = () => ({ setData: vi.fn(), getData: vi.fn(), effectAllowed: "", dropEffect: "" });
+  const column = (slot: { getByRole: typeof screen.getByRole }, label: string) =>
+    slot.getByRole("region", { name: new RegExp(`^${label}, `) });
+  const toActive = { id: "21", name: "Start", toStatus: "In Progress", toStatusCategory: "indeterminate", requiredFields: [] };
+  const toReview = { id: "31", name: "Ready for review", toStatus: "In Review", toStatusCategory: "indeterminate", requiredFields: [] };
+  const toQa = { id: "32", name: "Send to QA", toStatus: "QA", toStatusCategory: "indeterminate", requiredFields: [] };
+
+  async function drag(slot: { getByRole: typeof screen.getByRole; findByText: typeof screen.findByText }, title: string, target: string) {
+    const card = (await slot.findByText(title)).closest("button")!;
+    const transfer = dataTransfer();
+    fireEvent.dragStart(card, { dataTransfer: transfer });
+    const destination = column(slot, target);
+    await vi.waitFor(() => expect(destination.getAttribute("data-drop-target")).toBe("allowed"));
+    fireEvent.dragOver(destination, { dataTransfer: transfer });
+    fireEvent.drop(destination, { dataTransfer: transfer });
+    fireEvent.dragEnd(card, { dataTransfer: transfer });
+    return card;
+  }
+
+  it("drags a ticket to another column to transition it in Jira", async () => {
+    const queued = otherIssues[0]!;
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, {
+      rpc: {
+        board_get: () => editableState([issue, queued]),
+        issue_transitions_get: () => ({ transitions: [toActive, toReview] }),
+        issue_transition: () => editableState([issue, { ...queued, status: "In Progress", statusCategory: "indeterminate" }]),
+      },
+    });
+
+    const card = await drag(slot, "Queue the provider cleanup", "Active");
+    expect(card.getAttribute("draggable")).toBe("true");
+    await vi.waitFor(() =>
+      expect(slot.rpcCalls).toContainEqual({ method: "issue_transition", input: { key: "ACME-2", transitionId: "21" } }),
+    );
+    await vi.waitFor(() => expect(within(column(slot, "Active")).getByText("Queue the provider cleanup")).toBeTruthy());
+    expect(within(column(slot, "Queue")).queryByText("Queue the provider cleanup")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("dims columns the workflow can't reach and asks which status when several fit", async () => {
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, {
+      rpc: {
+        board_get: () => editableState([issue]),
+        issue_transitions_get: () => ({ transitions: [toReview, toQa] }),
+        issue_transition: () => editableState([{ ...issue, status: "QA" }]),
+      },
+    });
+
+    const card = (await slot.findByText("Ship the focused Jira board")).closest("button")!;
+    const transfer = dataTransfer();
+    fireEvent.dragStart(card, { dataTransfer: transfer });
+    await vi.waitFor(() => expect(column(slot, "Queue").getAttribute("data-drop-target")).toBeNull());
+    expect(column(slot, "Review").getAttribute("data-drop-target")).toBe("allowed");
+    fireEvent.drop(column(slot, "Review"), { dataTransfer: transfer });
+    fireEvent.dragEnd(card);
+
+    fireEvent.click(await screen.findByRole("button", { name: /^QA/ }));
+    await vi.waitFor(() =>
+      expect(slot.rpcCalls).toContainEqual({ method: "issue_transition", input: { key: "ACME-1", transitionId: "32" } }),
+    );
+    slot.lifecycle.unmount();
+  });
+
+  it("puts the card back when Jira refuses the move", async () => {
+    const queued = otherIssues[0]!;
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, {
+      rpc: {
+        board_get: () => editableState([queued]),
+        issue_transitions_get: () => ({ transitions: [toActive] }),
+        issue_transition: () => {
+          throw new Error("You don't have permission to transition this issue.");
+        },
+      },
+    });
+    await drag(slot, "Queue the provider cleanup", "Active");
+    await vi.waitFor(() => expect(slot.rpcCalls.some((call) => call.method === "issue_transition")).toBe(true));
+    await vi.waitFor(() => expect(within(column(slot, "Queue")).getByText("Queue the provider cleanup")).toBeTruthy());
+    slot.lifecycle.unmount();
+  });
+
+  it("changes status, story points, and sprint from the details panel", async () => {
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, {
+      rpc: {
+        board_get: () => editableState([{ ...issue, storyPoints: 3 }]),
+        issue_comments_get: () => ({ cached: true, comments: [] }),
+        issue_edit_options_get: () => ({
+          transitions: [toReview],
+          storyPoints: { editable: true },
+          priority: { editable: true, options: [{ id: "1", name: "Highest" }, { id: "2", name: "High" }] },
+          sprint: {
+            editable: true,
+            currentId: null,
+            options: [{ id: "42", name: "Platform 24", state: "active" }],
+          },
+        }),
+        issue_update: () => editableState([{ ...issue, storyPoints: 8 }]),
+        issue_transition: () => editableState([{ ...issue, status: "In Review" }]),
+      },
+    });
+
+    fireEvent.click(await slot.findByText("Ship the focused Jira board"));
+    const drawer = await slot.findByRole("complementary", { name: "ACME-1 details" });
+
+    const pointsButton = await within(drawer).findByRole("button", { name: "Change story points" });
+    await vi.waitFor(() => expect((pointsButton as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(pointsButton);
+    fireEvent.click(await screen.findByRole("button", { name: "8" }));
+    await vi.waitFor(() =>
+      expect(slot.rpcCalls).toContainEqual({ method: "issue_update", input: { key: "ACME-1", storyPoints: 8 } }),
+    );
+
+    const sprintButton = within(drawer).getByRole("button", { name: "Change sprint" });
+    await vi.waitFor(() => expect((sprintButton as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(sprintButton);
+    fireEvent.click(await screen.findByRole("button", { name: /Platform 24/ }));
+    await vi.waitFor(() =>
+      expect(slot.rpcCalls).toContainEqual({ method: "issue_update", input: { key: "ACME-1", sprintId: "42" } }),
+    );
+
+    const statusButton = within(drawer).getByRole("button", { name: "Change status" });
+    await vi.waitFor(() => expect((statusButton as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(statusButton);
+    fireEvent.click(await screen.findByRole("button", { name: /In Review/ }));
+    await vi.waitFor(() =>
+      expect(slot.rpcCalls).toContainEqual({ method: "issue_transition", input: { key: "ACME-1", transitionId: "31" } }),
+    );
+    slot.lifecycle.unmount();
+  });
+
+  it("stays read-only without an API token and says how to enable editing", async () => {
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, {
+      rpc: {
+        board_get: () => ({ ...boardState([issue]), configured: false, editable: false }),
+        issue_comments_get: () => ({ cached: true, comments: [] }),
+      },
+    });
+    const card = (await slot.findByText("Ship the focused Jira board")).closest("button")!;
+    expect(card.getAttribute("draggable")).toBe("false");
+    fireEvent.click(card);
+    const drawer = await slot.findByRole("complementary", { name: "ACME-1 details" });
+    expect(within(drawer).getByText(/add a Jira API token/)).toBeTruthy();
+    expect(within(drawer).queryByRole("button", { name: "Change status" })).toBeNull();
+    expect(slot.rpcCalls.some((call) => call.method === "issue_edit_options_get")).toBe(false);
+    slot.lifecycle.unmount();
+  });
+
+  it("asks for a required extra field when Jira refuses a move, then retries", async () => {
+    const capitalized = {
+      id: "customfield_12158",
+      name: "Capitalized",
+      required: false,
+      value: null as string | null,
+      options: [
+        { id: "13958", name: "Yes" },
+        { id: "13959", name: "No" },
+      ],
+    };
+    let attempts = 0;
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, {
+      rpc: {
+        board_get: () => editableState([issue]),
+        issue_comments_get: () => ({ cached: true, comments: [] }),
+        issue_transitions_get: () => ({ transitions: [toReview] }),
+        issue_edit_options_get: () => ({
+          transitions: [toReview],
+          fields: [capitalized],
+          storyPoints: { editable: true },
+          priority: { editable: false, options: [] },
+          sprint: { editable: false, currentId: null, options: [] },
+        }),
+        issue_update: () => {
+          capitalized.value = "13958";
+          return editableState([issue]);
+        },
+        issue_transition: () => {
+          attempts += 1;
+          if (capitalized.value === null) throw new Error("Capitalized: Capitalized is required.");
+          return editableState([{ ...issue, status: "In Review" }]);
+        },
+      },
+    });
+
+    // Dragging to Review is refused, so the plugin asks for Capitalized.
+    await drag(slot, "Ship the focused Jira board", "Review");
+    const prompt = await screen.findByRole("group", { name: "Capitalized options" });
+    expect(screen.getByText("Set Capitalized first")).toBeTruthy();
+    fireEvent.click(within(prompt).getByRole("button", { name: "Yes" }));
+
+    await vi.waitFor(() =>
+      expect(slot.rpcCalls).toContainEqual({
+        method: "issue_update",
+        input: { key: "ACME-1", fields: { customfield_12158: "13958" } },
+      }),
+    );
+    await vi.waitFor(() => expect(attempts).toBe(2));
+
+    // The details panel shows the field and its value.
+    fireEvent.click(slot.getByText("Ship the focused Jira board"));
+    const drawer = await slot.findByRole("complementary", { name: "ACME-1 details" });
+    const field = await within(drawer).findByRole("button", { name: "Change Capitalized" });
+    await vi.waitFor(() => expect(field.textContent).toContain("Yes"));
+    slot.lifecycle.unmount();
+  });
+});

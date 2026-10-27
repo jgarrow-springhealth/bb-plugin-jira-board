@@ -3,7 +3,7 @@ import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import plugin, { parseKeywords, parseProjectColors } from "./server";
+import plugin, { jqlFilter, parseKeywords, parseProjectColors, parseTransitions } from "./server";
 
 const normalizedIssue = {
   key: "ACME-1",
@@ -654,5 +654,368 @@ describe("Jira Board backend", () => {
     expect(state.snapshot).toMatchObject({ sprints: "disabled", sprintIssues: [] });
     expect(fetchMock).toHaveBeenCalledTimes(3);
     await harness.lifecycle.dispose();
+  });
+});
+
+describe("Jira Board editing", () => {
+  const tokenSettings = {
+    jiraSiteUrl: "https://example.atlassian.net",
+    jiraEmail: "alex@example.com",
+    jiraApiToken: "secret-token",
+  };
+  const sprintField = { id: "customfield_10020", name: "Sprint", schema: { custom: "com.pyxis.greenhopper.jira:gh-sprint" } };
+  const capitalizedField = { id: "customfield_12158", name: "Capitalized", schema: { type: "option" } };
+  const capitalizedOptions = [
+    { id: "13958", value: "Yes" },
+    { id: "13959", value: "No" },
+    { id: "13960", value: "Retired", disabled: true },
+  ];
+  const json = (body: unknown, status = 200) =>
+    new Response(body === null ? null : JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+
+  type Call = { method: string; url: string; body: unknown };
+
+  /** A small Jira: one issue whose status, points, and sprint change as the plugin writes. */
+  function fakeJira(options: { boardMatches?: () => boolean; pointsOnScreen?: boolean } = {}) {
+    const calls: Call[] = [];
+    const issue = {
+      status: { name: "In Progress", statusCategory: { key: "indeterminate" } },
+      points: 5 as number | null,
+      sprints: [{ id: 42, name: "Platform 24", state: "active" }] as Array<{ id: number; name: string; state: string; boardId?: number }>,
+      capitalized: null as null | { id: string; value: string },
+    };
+    const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const href = String(url);
+      const method = init?.method ?? "GET";
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+      calls.push({ method, url: href, body });
+      const path = new URL(href).pathname;
+      if (path === "/rest/api/3/field") return json([...jiraFieldsResponse, sprintField, capitalizedField]);
+      if (path === "/rest/api/3/issue/ACME-1/transitions") {
+        if (method === "POST") {
+          if (body.transition.id === "61" && issue.capitalized === null) {
+            return json({ errorMessages: [], errors: { customfield_12158: "Capitalized is required." } }, 400);
+          }
+          if (body.transition.id === "31") issue.status = { name: "In Review", statusCategory: { key: "indeterminate" } };
+          if (body.transition.id === "41") issue.status = { name: "Done", statusCategory: { key: "done" } };
+          return json(null, 204);
+        }
+        return json({
+          transitions: [
+            { id: "31", name: "Ready for review", to: { name: "In Review", statusCategory: { key: "indeterminate" } } },
+            {
+              id: "41",
+              name: "Done",
+              to: { name: "Done", statusCategory: { key: "done" } },
+              fields: { resolution: { required: true, hasDefaultValue: false, name: "Resolution" } },
+            },
+            { id: "51", name: "Hidden", isAvailable: false, to: { name: "Nope", statusCategory: { key: "new" } } },
+          ],
+        });
+      }
+      if (path === "/rest/api/3/issue/ACME-1/editmeta") {
+        return json({
+          fields: {
+            ...(options.pointsOnScreen === false ? {} : { customfield_10016: {} }),
+            customfield_12158: { name: "Capitalized", required: false, allowedValues: capitalizedOptions },
+            customfield_10020: {},
+            priority: { allowedValues: [{ id: "1", name: "Highest" }, { id: "2", name: "High" }] },
+          },
+        });
+      }
+      if (path === "/rest/api/3/issue/ACME-1" && method === "PUT") {
+        if ("customfield_10016" in body.fields) issue.points = body.fields.customfield_10016;
+        if ("customfield_12158" in body.fields) {
+          const chosen = body.fields.customfield_12158;
+          issue.capitalized = chosen === null ? null : (capitalizedOptions.find((option) => option.id === chosen.id) ?? null);
+        }
+        return json(null, 204);
+      }
+      if (path === "/rest/api/3/issue/ACME-1") {
+        const base = jiraResponse.issues[0]!;
+        return json({
+          id: "10001",
+          key: "ACME-1",
+          fields: {
+            ...base.fields,
+            status: issue.status,
+            customfield_10016: issue.points,
+            customfield_10020: issue.sprints,
+            customfield_12158: issue.capitalized,
+          },
+        });
+      }
+      if (path === "/rest/api/3/search/jql") {
+        const matches = body.jql.includes("openSprints")
+          ? issue.sprints.some((sprint) => sprint.state === "active" || sprint.state === "future")
+          : (options.boardMatches?.() ?? issue.status.statusCategory.key !== "done");
+        return json({ issues: matches ? [{ id: "10001", key: "ACME-1" }] : [], isLast: true });
+      }
+      if (path === "/rest/agile/1.0/board") return json({ values: [{ id: 7, type: "scrum", name: "ACME board" }] });
+      if (path === "/rest/agile/1.0/issue/ACME-1/estimation") {
+        if (method === "PUT") {
+          issue.points = body.value === "" ? null : Number(body.value);
+          return json({ fieldId: "customfield_10016", value: issue.points });
+        }
+        return json({ fieldId: "customfield_10016", value: issue.points });
+      }
+      if (path === "/rest/agile/1.0/board/9") return json({ id: 9, name: "Shared team board" });
+      if (path === "/rest/agile/1.0/board/9/sprint") {
+        return json({ values: [{ id: 90, name: "Team 12", state: "active", originBoardId: 9 }] });
+      }
+      if (path === "/rest/agile/1.0/board/7/sprint") {
+        return json({
+          values: [
+            { id: 43, name: "Platform 25", state: "future", startDate: "2026-10-21T00:00:00.000Z" },
+            { id: 42, name: "Platform 24", state: "active", startDate: "2026-10-07T00:00:00.000Z" },
+          ],
+        });
+      }
+      if (path === "/rest/agile/1.0/sprint/43/issue") {
+        issue.sprints = [{ id: 43, name: "Platform 25", state: "future" }];
+        return json(null, 204);
+      }
+      if (path === "/rest/agile/1.0/backlog/issue") {
+        issue.sprints = [];
+        return json(null, 204);
+      }
+      if (path.endsWith("/comment")) return json(jiraCommentsResponse);
+      return json({ errorMessages: [`Unexpected ${method} ${path}`] }, 404);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return { calls, issue };
+  }
+
+  async function seededPlugin(settings: Record<string, unknown> = tokenSettings) {
+    const { bb, harness } = createFakePluginHost({ pluginId: "jira-board", settings });
+    await plugin(bb);
+    await bb.storage.kv.set("jira-board.snapshot.v1", {
+      issues: [normalizedIssue, { ...normalizedIssue, key: "ACME-2" }],
+      sprintIssues: [{ ...normalizedIssue, sprint: { id: "42", name: "Platform 24", goal: null, startDate: null, endDate: null } }],
+      sprints: "available",
+      refreshedAt: "2026-10-15T10:00:00.000Z",
+      source: "jira",
+    });
+    return { bb, harness };
+  }
+
+  it("is editable only with an API token and editing allowed", async () => {
+    const withToken = await seededPlugin();
+    expect((await withToken.harness.behavior.callRpc("board_get", null)).editable).toBe(true);
+    await withToken.harness.lifecycle.dispose();
+
+    const off = await seededPlugin({ ...tokenSettings, allowEditing: false });
+    expect((await off.harness.behavior.callRpc("board_get", null)).editable).toBe(false);
+    await expect(off.harness.behavior.callRpc("issue_transition", { key: "ACME-1", transitionId: "31" })).rejects.toThrow(
+      /turned off/,
+    );
+    await off.harness.lifecycle.dispose();
+
+    const mcp = await seededPlugin({});
+    expect((await mcp.harness.behavior.callRpc("board_get", null)).editable).toBe(false);
+    await expect(mcp.harness.behavior.callRpc("issue_update", { key: "ACME-1", storyPoints: 3 })).rejects.toThrow(/API token/);
+    await mcp.harness.lifecycle.dispose();
+  });
+
+  it("rejects malformed keys and ids before calling Jira", async () => {
+    const { calls } = fakeJira();
+    const { harness } = await seededPlugin();
+    await expect(harness.behavior.callRpc("issue_transition", { key: "../ACME-1", transitionId: "31" })).rejects.toThrow();
+    await expect(harness.behavior.callRpc("issue_update", { key: "ACME-1", sprintId: "42/../1" })).rejects.toThrow();
+    await expect(harness.behavior.callRpc("issue_update", { key: "ACME-1" })).rejects.toThrow();
+    expect(calls).toHaveLength(0);
+    await harness.lifecycle.dispose();
+  });
+
+  it("transitions an issue and patches it into the cached board", async () => {
+    const { calls } = fakeJira();
+    const { harness } = await seededPlugin();
+
+    const { transitions } = await harness.behavior.callRpc("issue_transitions_get", { key: "ACME-1" });
+    expect(transitions).toEqual([
+      { id: "31", name: "Ready for review", toStatus: "In Review", toStatusCategory: "indeterminate", requiredFields: [] },
+      { id: "41", name: "Done", toStatus: "Done", toStatusCategory: "done", requiredFields: ["Resolution"] },
+    ]);
+
+    const state = await harness.behavior.callRpc("issue_transition", { key: "ACME-1", transitionId: "31" });
+
+    expect(calls).toContainEqual(
+      expect.objectContaining({ method: "POST", url: expect.stringContaining("/issue/ACME-1/transitions"), body: { transition: { id: "31" } } }),
+    );
+    const search = calls.find((call) => call.url.endsWith("/search/jql"));
+    expect(search?.body).toMatchObject({
+      jql: 'key = "ACME-1" AND (assignee = currentUser() AND statusCategory != Done)',
+      reconcileIssues: [10001],
+    });
+    expect(state.snapshot?.issues.map((issue) => [issue.key, issue.status])).toEqual([
+      ["ACME-1", "In Review"],
+      ["ACME-2", "In Progress"],
+    ]);
+    expect(state.snapshot?.sprintIssues[0]).toMatchObject({ status: "In Review", sprint: { id: "42" } });
+    expect(state.snapshot?.refreshedAt).toBe("2026-10-15T10:00:00.000Z");
+    expect(harness.realtimeSignals).toContainEqual(expect.objectContaining({ channel: "jira-issues-changed" }));
+    await harness.lifecycle.dispose();
+  });
+
+  it("drops an issue from the board when it no longer matches the board JQL", async () => {
+    fakeJira({ boardMatches: () => false });
+    const { harness } = await seededPlugin();
+    const state = await harness.behavior.callRpc("issue_transition", { key: "ACME-1", transitionId: "31" });
+    expect(state.snapshot?.issues.map((issue) => issue.key)).toEqual(["ACME-2"]);
+    expect(state.snapshot?.sprintIssues.map((issue) => issue.key)).toEqual(["ACME-1"]);
+    await harness.lifecycle.dispose();
+  });
+
+  it("lists what the details panel can change", async () => {
+    fakeJira();
+    const { harness } = await seededPlugin();
+    const options = await harness.behavior.callRpc("issue_edit_options_get", { key: "ACME-1" });
+    expect(options).toEqual({
+      transitions: expect.arrayContaining([expect.objectContaining({ id: "31" })]),
+      fields: [
+        {
+          id: "customfield_12158",
+          name: "Capitalized",
+          required: false,
+          value: null,
+          options: [
+            { id: "13958", name: "Yes" },
+            { id: "13959", name: "No" },
+          ],
+        },
+      ],
+      storyPoints: { editable: true },
+      priority: { editable: true, options: [{ id: "1", name: "Highest" }, { id: "2", name: "High" }] },
+      sprint: {
+        editable: true,
+        currentId: "42",
+        options: [
+          { id: "42", name: "Platform 24", state: "active", board: "ACME board" },
+          { id: "43", name: "Platform 25", state: "future", board: "ACME board" },
+        ],
+      },
+    });
+    await harness.lifecycle.dispose();
+  });
+
+  it("updates story points through the field on the issue's edit screen", async () => {
+    const { calls } = fakeJira();
+    const { harness } = await seededPlugin();
+    const state = await harness.behavior.callRpc("issue_update", { key: "ACME-1", storyPoints: 8, priorityId: "1" });
+    expect(calls.find((call) => call.method === "PUT")?.body).toEqual({
+      fields: { customfield_10016: 8, priority: { id: "1" } },
+    });
+    expect(state.snapshot?.issues[0]).toMatchObject({ key: "ACME-1", storyPoints: 8 });
+
+    await harness.behavior.callRpc("issue_update", { key: "ACME-1", storyPoints: null });
+    expect(calls.filter((call) => call.method === "PUT").at(-1)?.body).toEqual({ fields: { customfield_10016: null } });
+    await harness.lifecycle.dispose();
+  });
+
+  it("edits extra single-select fields and names them in workflow errors", async () => {
+    const { calls } = fakeJira();
+    const { harness } = await seededPlugin();
+
+    await expect(harness.behavior.callRpc("issue_transition", { key: "ACME-1", transitionId: "61" })).rejects.toThrow(
+      "Capitalized: Capitalized is required.",
+    );
+
+    await harness.behavior.callRpc("issue_update", { key: "ACME-1", fields: { customfield_12158: "13958" } });
+    expect(calls.find((call) => call.method === "PUT")?.body).toEqual({ fields: { customfield_12158: { id: "13958" } } });
+    const options = await harness.behavior.callRpc("issue_edit_options_get", { key: "ACME-1" });
+    expect(options.fields[0]?.value).toBe("13958");
+
+    await harness.behavior.callRpc("issue_update", { key: "ACME-1", fields: { customfield_12158: null } });
+    expect(calls.filter((call) => call.method === "PUT").at(-1)?.body).toEqual({ fields: { customfield_12158: null } });
+
+    await expect(
+      harness.behavior.callRpc("issue_update", { key: "ACME-1", fields: { customfield_10016: "1" } }),
+    ).rejects.toThrow(/isn't in the Extra fields/);
+    await harness.lifecycle.dispose();
+  });
+
+  it("hides extra fields when the setting is cleared", async () => {
+    fakeJira();
+    const { harness } = await seededPlugin({ ...tokenSettings, extraFields: "" });
+    expect((await harness.behavior.callRpc("issue_edit_options_get", { key: "ACME-1" })).fields).toEqual([]);
+    await harness.lifecycle.dispose();
+  });
+
+  it("estimates through the board when story points aren't on the edit screen", async () => {
+    const { calls } = fakeJira({ pointsOnScreen: false });
+    const { harness } = await seededPlugin();
+    expect((await harness.behavior.callRpc("issue_edit_options_get", { key: "ACME-1" })).storyPoints).toEqual({ editable: true });
+
+    const state = await harness.behavior.callRpc("issue_update", { key: "ACME-1", storyPoints: 3 });
+    expect(calls.some((call) => call.method === "PUT" && call.url.includes("/rest/api/3/issue/"))).toBe(false);
+    expect(calls).toContainEqual(
+      expect.objectContaining({
+        method: "PUT",
+        url: expect.stringContaining("/rest/agile/1.0/issue/ACME-1/estimation?boardId=7"),
+        body: { value: "3" },
+      }),
+    );
+    expect(state.snapshot?.issues[0]).toMatchObject({ key: "ACME-1", storyPoints: 3 });
+
+    await harness.behavior.callRpc("issue_update", { key: "ACME-1", storyPoints: null });
+    expect(calls.filter((call) => call.method === "PUT").at(-1)?.body).toEqual({ value: "" });
+    await harness.lifecycle.dispose();
+  });
+
+  it("includes the board that owns the issue's sprint when it belongs to another project", async () => {
+    const { calls, issue } = fakeJira({ pointsOnScreen: false });
+    issue.sprints = [{ id: 90, name: "Team 12", state: "active", boardId: 9 }];
+    const { harness } = await seededPlugin();
+    const options = await harness.behavior.callRpc("issue_edit_options_get", { key: "ACME-1" });
+    expect(options.sprint.currentId).toBe("90");
+    expect(options.sprint.options).toContainEqual({ id: "90", name: "Team 12", state: "active", board: "Shared team board" });
+    const estimations = calls.filter((call) => call.url.includes("/estimation"));
+    expect(estimations[0]?.url).toContain("boardId=9");
+    await harness.lifecycle.dispose();
+  });
+
+  it("moves an issue between sprints and to the backlog", async () => {
+    const { calls } = fakeJira();
+    const { harness } = await seededPlugin();
+
+    let state = await harness.behavior.callRpc("issue_update", { key: "ACME-1", sprintId: "43" });
+    expect(calls).toContainEqual(
+      expect.objectContaining({ method: "POST", url: expect.stringContaining("/rest/agile/1.0/sprint/43/issue"), body: { issues: ["ACME-1"] } }),
+    );
+    // Still in an open (future) sprint, so it stays in the sprint list without an active sprint.
+    expect(state.snapshot?.sprintIssues.find((issue) => issue.key === "ACME-1")?.sprint).toBeNull();
+
+    state = await harness.behavior.callRpc("issue_update", { key: "ACME-1", sprintId: null });
+    expect(calls).toContainEqual(
+      expect.objectContaining({ method: "POST", url: expect.stringContaining("/rest/agile/1.0/backlog/issue") }),
+    );
+    expect(state.snapshot?.sprintIssues.map((issue) => issue.key)).toEqual([]);
+    expect(state.snapshot?.issues.map((issue) => issue.key)).toEqual(["ACME-1", "ACME-2"]);
+    await harness.lifecycle.dispose();
+  });
+
+  it("surfaces Jira's own error and leaves the cache alone", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) =>
+        String(url).endsWith("/rest/api/3/field")
+          ? json(jiraFieldsResponse)
+          : json({ errorMessages: [], errors: { resolution: "Resolution is required." } }, 400),
+      ),
+    );
+    const { harness } = await seededPlugin();
+    await expect(harness.behavior.callRpc("issue_transition", { key: "ACME-1", transitionId: "41" })).rejects.toThrow(
+      "resolution: Resolution is required.",
+    );
+    expect((await harness.behavior.callRpc("board_get", null)).snapshot?.issues[0]?.status).toBe("In Progress");
+    await harness.lifecycle.dispose();
+  });
+
+  it("parses transitions and strips ORDER BY from JQL", () => {
+    expect(parseTransitions({ transitions: [{ id: 5, name: "Go", to: { name: "Doing" } }] })).toEqual([
+      { id: "5", name: "Go", toStatus: "Doing", toStatusCategory: "undefined", requiredFields: [] },
+    ]);
+    expect(jqlFilter("assignee = currentUser() ORDER BY updated DESC")).toBe("assignee = currentUser()");
+    expect(jqlFilter("order by created")).toBe("");
   });
 });

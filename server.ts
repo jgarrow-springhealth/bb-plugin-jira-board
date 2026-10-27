@@ -142,6 +142,8 @@ export type JiraSnapshot = z.infer<typeof snapshotSchema>;
 
 const boardStateSchema = z.object({
   configured: z.boolean(),
+  /** Whether the page may change Jira: an API token is set and editing is allowed in settings. */
+  editable: z.boolean().default(false),
   siteUrl: z.string(),
   phaseRules: z.object({
     queue: z.array(z.string()),
@@ -155,6 +157,73 @@ const boardStateSchema = z.object({
 });
 export type BoardState = z.infer<typeof boardStateSchema>;
 
+const ISSUE_KEY_PATTERN = /^[A-Z][A-Z0-9_]*-\d+$/;
+const issueKeySchema = z.string().regex(ISSUE_KEY_PATTERN, "Expected a Jira issue key, for example ABC-123.");
+const jiraIdSchema = z.string().regex(/^\d+$/, "Expected a numeric Jira id.");
+
+const transitionSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  toStatus: z.string(),
+  toStatusCategory: z.string(),
+  /** Required fields on the transition screen without a default; the board cannot fill them in. */
+  requiredFields: z.array(z.string()),
+});
+export type JiraTransition = z.infer<typeof transitionSchema>;
+
+const choiceSchema = z.object({ id: z.string(), name: z.string() });
+const sprintChoiceSchema = choiceSchema.extend({
+  state: z.enum(["active", "future"]),
+  /** The board the sprint belongs to, to tell same-named sprints apart. */
+  board: z.string().nullable().default(null),
+});
+export type SprintChoice = z.infer<typeof sprintChoiceSchema>;
+
+/** A single-select field from the Extra fields setting, such as Capitalized. */
+const extraFieldSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  required: z.boolean(),
+  /** The selected option's id, or null when unset. */
+  value: z.string().nullable(),
+  options: z.array(choiceSchema),
+});
+export type ExtraField = z.infer<typeof extraFieldSchema>;
+
+const editOptionsSchema = z.object({
+  transitions: z.array(transitionSchema),
+  /** Extra single-select fields on the issue's edit screen. */
+  fields: z.array(extraFieldSchema).default([]),
+  storyPoints: z.object({ editable: z.boolean() }),
+  priority: z.object({ editable: z.boolean(), options: z.array(choiceSchema) }),
+  sprint: z.object({
+    editable: z.boolean(),
+    currentId: z.string().nullable(),
+    options: z.array(sprintChoiceSchema),
+  }),
+});
+export type EditOptions = z.infer<typeof editOptionsSchema>;
+
+/** Omitted fields stay as they are; `null` clears story points or moves the issue to the backlog. */
+const issueUpdateSchema = z
+  .object({
+    key: issueKeySchema,
+    storyPoints: z.number().min(0).max(1000).nullable().optional(),
+    priorityId: jiraIdSchema.optional(),
+    sprintId: jiraIdSchema.nullable().optional(),
+    /** Extra single-select fields by id: an option id, or null to clear. */
+    fields: z.record(z.string().regex(/^customfield_\d+$/, "Expected a custom field id."), jiraIdSchema.nullable()).optional(),
+  })
+  .refine(
+    (update) =>
+      update.storyPoints !== undefined ||
+      update.priorityId !== undefined ||
+      update.sprintId !== undefined ||
+      Object.keys(update.fields ?? {}).length > 0,
+    "Choose a field to update.",
+  );
+export type IssueUpdate = z.infer<typeof issueUpdateSchema>;
+
 export const rpcContract = defineRpcContract({
   board_get: {
     input: z.null(),
@@ -162,6 +231,24 @@ export const rpcContract = defineRpcContract({
   },
   board_refresh: {
     input: z.null(),
+    output: boardStateSchema,
+  },
+  /** Workflow transitions available to the issue right now, for drag and drop. */
+  issue_transitions_get: {
+    input: z.object({ key: issueKeySchema }),
+    output: z.object({ transitions: z.array(transitionSchema) }),
+  },
+  /** Everything the details panel can change on the issue, with current choices. */
+  issue_edit_options_get: {
+    input: z.object({ key: issueKeySchema }),
+    output: editOptionsSchema,
+  },
+  issue_transition: {
+    input: z.object({ key: issueKeySchema, transitionId: jiraIdSchema }),
+    output: boardStateSchema,
+  },
+  issue_update: {
+    input: issueUpdateSchema,
     output: boardStateSchema,
   },
   issue_comments_get: {
@@ -353,7 +440,12 @@ export async function jiraFetch(url: string | URL, init: RequestInit): Promise<R
 const STORY_POINT_FIELD_NAMES = ["story points", "story point estimate"];
 const SPRINT_FIELD_TYPE = "com.pyxis.greenhopper.jira:gh-sprint";
 
-type FieldIds = { storyPoints: string[]; sprint: string[] };
+type FieldIds = {
+  storyPoints: string[];
+  sprint: string[];
+  /** Single-select fields named in the Extra fields setting. */
+  extra?: Array<{ id: string; name: string }>;
+};
 
 /**
  * The custom field ids for story points and sprints, from the site's field
@@ -361,7 +453,12 @@ type FieldIds = { storyPoints: string[]; sprint: string[] };
  * configured name, or Jira's usual names when nothing is configured, is
  * matched by name. Sites without Jira Software have no sprint field.
  */
-async function resolveFields(siteUrl: string, authorization: string, storyPointsSetting: string): Promise<FieldIds> {
+async function resolveFields(
+  siteUrl: string,
+  authorization: string,
+  storyPointsSetting: string,
+  extraFieldsSetting = "",
+): Promise<FieldIds> {
   const response = await jiraFetch(`${siteUrl}/rest/api/3/field`, {
     headers: { authorization: `Basic ${authorization}`, accept: "application/json" },
     signal: AbortSignal.timeout(30_000),
@@ -389,7 +486,18 @@ async function resolveFields(siteUrl: string, authorization: string, storyPoints
     .filter((field) => asString(nested(field, "schema")?.custom) === SPRINT_FIELD_TYPE)
     .map((field) => asString(field.id))
     .filter(Boolean);
-  return { storyPoints, sprint: sprint.length > 0 ? sprint : named(["sprint"]).filter(Boolean) };
+  // Extra fields: names or ids of single-select fields; unknown or other field types are skipped.
+  const extra: Array<{ id: string; name: string }> = [];
+  for (const wantedField of parseKeywords(extraFieldsSetting)) {
+    const field = fields.find(
+      (candidate) =>
+        asString(candidate.id).toLowerCase() === wantedField || asString(candidate.name).trim().toLowerCase() === wantedField,
+    );
+    if (field === undefined || asString(nested(field, "schema")?.type) !== "option") continue;
+    const id = asString(field.id);
+    if (!extra.some((known) => known.id === id)) extra.push({ id, name: asString(field.name, id) });
+  }
+  return { storyPoints, sprint: sprint.length > 0 ? sprint : named(["sprint"]).filter(Boolean), extra };
 }
 
 /** The issue's active sprint from Jira's sprint field (a list of sprint objects). */
@@ -650,6 +758,244 @@ async function fetchIssues(settings: {
   return { issues: withComments(issues), sprintIssues: withComments(sprintIssues), sprints };
 }
 
+// ---- Editing ----------------------------------------------------------------
+
+type JiraConnection = { siteUrl: string; authorization: string };
+
+function jiraErrorMessage(payload: unknown): string | null {
+  const record = asRecord(payload);
+  const messages = Array.isArray(record?.errorMessages)
+    ? record.errorMessages.filter((item): item is string => typeof item === "string" && item.trim() !== "")
+    : [];
+  if (messages[0] !== undefined) return messages[0];
+  const errors = asRecord(record?.errors);
+  const first = errors === null ? undefined : Object.entries(errors).find(([, value]) => typeof value === "string");
+  return first === undefined ? null : `${first[0]}: ${String(first[1])}`;
+}
+
+/** One JSON request to Jira; rejects with Jira's own error message when it refuses. */
+async function jiraRequest(
+  connection: JiraConnection,
+  method: "GET" | "POST" | "PUT",
+  path: string,
+  body?: unknown,
+): Promise<unknown> {
+  const response = await jiraFetch(`${connection.siteUrl}${path}`, {
+    method,
+    headers: {
+      authorization: `Basic ${connection.authorization}`,
+      accept: "application/json",
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  const text = await response.text();
+  let payload: unknown = null;
+  try {
+    payload = text === "" ? null : JSON.parse(text);
+  } catch {
+    if (response.ok) throw new Error(`Jira returned ${response.status} with an invalid response.`);
+  }
+  if (!response.ok) {
+    throw new Error(jiraErrorMessage(payload) ?? `Jira refused the change (${response.status} ${response.statusText}).`);
+  }
+  return payload;
+}
+
+function issuePath(key: string): string {
+  return `/rest/api/3/issue/${encodeURIComponent(key)}`;
+}
+
+export function parseTransitions(payload: unknown): JiraTransition[] {
+  const list = asRecord(payload)?.transitions;
+  if (!Array.isArray(list)) return [];
+  return list.flatMap((raw) => {
+    const transition = asRecord(raw);
+    if (transition === null || transition.isAvailable === false) return [];
+    const id = typeof transition.id === "number" ? String(transition.id) : asString(transition.id);
+    if (!/^\d+$/.test(id)) return [];
+    const to = nested(transition, "to");
+    const requiredFields = Object.values(nested(transition, "fields") ?? {})
+      .map(asRecord)
+      .filter((field) => field !== null && field.required === true && field.hasDefaultValue !== true)
+      .map((field) => asString(field!.name, "a field"));
+    const name = asString(transition.name, "Transition");
+    return [
+      {
+        id,
+        name,
+        toStatus: asString(to?.name, name),
+        toStatusCategory: asString(nested(to, "statusCategory")?.key, "undefined"),
+        requiredFields,
+      },
+    ];
+  });
+}
+
+async function fetchTransitions(connection: JiraConnection, key: string): Promise<JiraTransition[]> {
+  return parseTransitions(
+    await jiraRequest(connection, "GET", `${issuePath(key)}/transitions?expand=transitions.fields`),
+  );
+}
+
+/** The issue's open sprint (active first, then the earliest future one) from the sprint field. */
+function openSprintFrom(fields: Record<string, unknown>, fieldIds: string[]): SprintChoice | null {
+  const open: SprintChoice[] = [];
+  for (const id of fieldIds) {
+    const value = fields[id];
+    if (!Array.isArray(value)) continue;
+    for (const raw of value) {
+      const sprint = asRecord(raw);
+      const state = asString(sprint?.state).toLowerCase();
+      if (sprint === null || (state !== "active" && state !== "future")) continue;
+      const identifier = typeof sprint.id === "number" ? String(sprint.id) : asString(sprint.id);
+      if (identifier === "") continue;
+      open.push({ id: identifier, name: asString(sprint.name, `Sprint ${identifier}`), state, board: null });
+    }
+  }
+  return open.find((sprint) => sprint.state === "active") ?? open[0] ?? null;
+}
+
+type ProjectBoards = { boards: Array<{ id: number; name: string }>; sprints: SprintChoice[] };
+
+/** Boards that own the issue's open sprints, which can belong to another project's board. */
+function sprintBoardIds(fields: Record<string, unknown>, fieldIds: string[]): number[] {
+  const ids = new Set<number>();
+  for (const id of fieldIds) {
+    const value = fields[id];
+    for (const raw of Array.isArray(value) ? value : []) {
+      const sprint = asRecord(raw);
+      const state = asString(sprint?.state).toLowerCase();
+      if ((state === "active" || state === "future") && typeof sprint?.boardId === "number") ids.add(sprint.boardId);
+    }
+  }
+  return [...ids];
+}
+
+/**
+ * The boards that own the issue's sprints, then the project's scrum boards
+ * (up to six in all), with their active and future sprints.
+ */
+async function fetchProjectBoards(
+  connection: JiraConnection,
+  project: string,
+  sprintBoards: number[] = [],
+): Promise<ProjectBoards> {
+  const payload = asRecord(
+    await jiraRequest(
+      connection,
+      "GET",
+      `/rest/agile/1.0/board?projectKeyOrId=${encodeURIComponent(project)}&type=scrum&maxResults=10`,
+    ),
+  );
+  const projectBoards = (Array.isArray(payload?.values) ? payload.values : [])
+    .map(asRecord)
+    .filter((board): board is Record<string, unknown> => board !== null && typeof board.id === "number")
+    .map((board) => ({ id: board.id as number, name: asString(board.name, `Board ${board.id}`) }));
+  const owning = await Promise.all(
+    sprintBoards
+      .filter((id) => !projectBoards.some((board) => board.id === id))
+      .map(async (id) => {
+        try {
+          return { id, name: asString(asRecord(await jiraRequest(connection, "GET", `/rest/agile/1.0/board/${id}`))?.name, `Board ${id}`) };
+        } catch {
+          return { id, name: `Board ${id}` };
+        }
+      }),
+  );
+  const boards = [
+    ...projectBoards.filter((board) => sprintBoards.includes(board.id)),
+    ...owning,
+    ...projectBoards.filter((board) => !sprintBoards.includes(board.id)),
+  ].slice(0, 6);
+  const boardNames = new Map(boards.map((board) => [board.id, board.name]));
+  const sprints = new Map<string, SprintChoice & { startDate: string }>();
+  await Promise.all(
+    boards.map(async (board) => {
+      let page: unknown;
+      try {
+        page = await jiraRequest(
+          connection,
+          "GET",
+          `/rest/agile/1.0/board/${board.id}/sprint?state=active,future&maxResults=50`,
+        );
+      } catch {
+        return; // A board without sprint access should not hide the others.
+      }
+      const values = asRecord(page)?.values;
+      for (const raw of Array.isArray(values) ? values : []) {
+        const sprint = asRecord(raw);
+        const state = asString(sprint?.state).toLowerCase();
+        if (sprint === null || typeof sprint.id !== "number" || (state !== "active" && state !== "future")) continue;
+        const origin = typeof sprint.originBoardId === "number" ? sprint.originBoardId : board.id;
+        sprints.set(String(sprint.id), {
+          id: String(sprint.id),
+          name: asString(sprint.name, `Sprint ${sprint.id}`),
+          state,
+          board: boardNames.get(origin) ?? board.name,
+          startDate: asString(sprint.startDate),
+        });
+      }
+    }),
+  );
+  return {
+    boards,
+    sprints: [...sprints.values()]
+      .sort(
+        (a, b) =>
+          Number(a.state === "future") - Number(b.state === "future") ||
+          (a.startDate || "9999").localeCompare(b.startDate || "9999") ||
+          Number(a.id) - Number(b.id),
+      )
+      .map(({ startDate: _startDate, ...sprint }) => sprint),
+  };
+}
+
+/**
+ * The first board that estimates the issue with a story points field. Boards
+ * can set estimates even when the field is not on the issue's edit screen,
+ * which is how Jira's own board sets them.
+ */
+async function boardEstimation(
+  connection: JiraConnection,
+  key: string,
+  boards: ProjectBoards["boards"],
+  storyPointFields: string[],
+): Promise<{ boardId: number; fieldId: string } | null> {
+  for (const board of boards) {
+    try {
+      const estimation = asRecord(
+        await jiraRequest(connection, "GET", `/rest/agile/1.0/issue/${encodeURIComponent(key)}/estimation?boardId=${board.id}`),
+      );
+      const fieldId = asString(estimation?.fieldId);
+      if (storyPointFields.includes(fieldId)) return { boardId: board.id, fieldId };
+    } catch {
+      // Try the next board.
+    }
+  }
+  return null;
+}
+
+/** The JQL's filter without its ORDER BY clause, so it can be combined with `key = X`. */
+export function jqlFilter(jql: string): string {
+  return jql.replace(/\border\s+by\b[\s\S]*$/i, "").trim();
+}
+
+/** Whether the issue currently matches the JQL, read-after-write consistent for this issue. */
+async function issueMatchesJql(connection: JiraConnection, jql: string, key: string, id: string): Promise<boolean> {
+  const filter = jqlFilter(jql);
+  const payload = asRecord(
+    await jiraRequest(connection, "POST", "/rest/api/3/search/jql", {
+      jql: filter === "" ? `key = "${key}"` : `key = "${key}" AND (${filter})`,
+      fields: ["key"],
+      maxResults: 1,
+      ...(/^\d+$/.test(id) ? { reconcileIssues: [Number(id)] } : {}),
+    }),
+  );
+  return Array.isArray(payload?.issues) && payload.issues.length > 0;
+}
+
 type BoardSettings = {
   jiraSiteUrl: string;
   jiraEmail?: string;
@@ -660,6 +1006,7 @@ type BoardSettings = {
   blockedStatuses: string;
   reviewStatuses: string;
   projectColors: string;
+  allowEditing?: boolean;
 };
 
 function hasApiToken(settings: BoardSettings): boolean {
@@ -681,6 +1028,7 @@ function safeProjectColors(value: string): Record<string, string> {
 function formatState(settings: BoardSettings, snapshot: JiraSnapshot | null) {
   return boardStateSchema.parse({
     configured: hasApiToken(settings),
+    editable: hasApiToken(settings) && settings.allowEditing !== false,
     siteUrl: normalizeSiteUrl(settings.jiraSiteUrl),
     phaseRules: {
       queue: parseKeywords(settings.queueStatuses),
@@ -732,6 +1080,20 @@ export default async function plugin(bb: BbPluginApi) {
       description:
         "Create one at id.atlassian.com/manage-profile/security/api-tokens. Stored server-side and never sent to the page or to agents.",
       secret: true,
+    },
+    allowEditing: {
+      type: "boolean",
+      label: "Edit Jira from the board",
+      description:
+        "Lets you drag tickets between columns to change their status, and change story points, priority, and sprint from the details panel. Needs the API token. Turn off to keep the board read-only.",
+      default: true,
+    },
+    extraFields: {
+      type: "string",
+      label: "Extra fields to edit",
+      description:
+        "Comma-separated names or ids of single-select Jira fields to show and edit in the details panel, for example Capitalized. Useful when your workflow requires one before a status change. Clear it to hide them.",
+      default: "Capitalized",
     },
     storyPointsField: {
       type: "string",
@@ -785,6 +1147,10 @@ export default async function plugin(bb: BbPluginApi) {
   let refreshInFlight: Promise<JiraSnapshot> | null = null;
   let mcpRefreshInFlight: Promise<JiraSnapshot> | null = null;
   let jiraProjectInFlight: Promise<string> | null = null;
+  let fieldCache: { key: string; at: number; ids: Promise<FieldIds> } | null = null;
+  const boardCache = new Map<string, { at: number; boards: Promise<ProjectBoards> }>();
+  /** Serializes read-modify-write updates to the cached snapshot. */
+  let snapshotQueue: Promise<unknown> = Promise.resolve();
 
   async function readSnapshot(): Promise<JiraSnapshot | null> {
     const value = await bb.storage.kv.get<unknown>(SNAPSHOT_KEY);
@@ -823,6 +1189,244 @@ export default async function plugin(bb: BbPluginApi) {
       refreshedAt: snapshot.refreshedAt,
       count: snapshot.issues.length,
     });
+  }
+
+  type EditConnection = JiraConnection & { storyPointsField: string; extraFields: string };
+
+  async function editConnection(): Promise<EditConnection> {
+    const current = await settings.get();
+    if (!current.allowEditing) {
+      throw new Error("Editing Jira is turned off. Turn on Edit Jira from the board in Jira Board settings.");
+    }
+    if (!hasApiToken(current) || !current.jiraEmail || !current.jiraApiToken) {
+      throw new Error("Editing Jira needs the Jira site URL, account email, and API token in Jira Board settings.");
+    }
+    return {
+      siteUrl: normalizeSiteUrl(current.jiraSiteUrl),
+      authorization: Buffer.from(`${current.jiraEmail}:${current.jiraApiToken}`).toString("base64"),
+      storyPointsField: current.storyPointsField,
+      extraFields: current.extraFields,
+    };
+  }
+
+  /** Field ids rarely change, so edits reuse them for ten minutes. */
+  function fieldIdsFor(connection: EditConnection): Promise<FieldIds> {
+    const key = `${connection.siteUrl}|${connection.authorization}|${connection.storyPointsField}|${connection.extraFields}`;
+    if (fieldCache === null || fieldCache.key !== key || Date.now() - fieldCache.at > 600_000) {
+      const ids = resolveFields(
+        connection.siteUrl,
+        connection.authorization,
+        connection.storyPointsField,
+        connection.extraFields,
+      );
+      const entry = { key, at: Date.now(), ids };
+      fieldCache = entry;
+      ids.catch(() => {
+        if (fieldCache === entry) fieldCache = null;
+      });
+    }
+    return fieldCache.ids;
+  }
+
+  function projectBoards(connection: JiraConnection, project: string, sprintBoards: number[]): Promise<ProjectBoards> {
+    const cacheKey = `${project}|${[...sprintBoards].sort((a, b) => a - b).join(",")}`;
+    const cached = boardCache.get(cacheKey);
+    if (cached !== undefined && Date.now() - cached.at < 120_000) return cached.boards;
+    const boards = fetchProjectBoards(connection, project, sprintBoards);
+    boardCache.set(cacheKey, { at: Date.now(), boards });
+    boards.catch(() => boardCache.delete(cacheKey));
+    return boards;
+  }
+
+  async function editOptions(key: string): Promise<EditOptions> {
+    const connection = await editConnection();
+    const fieldIds = await fieldIdsFor(connection);
+    // The editmeta endpoint describes every editable field; `expand=editmeta` only covers requested ones.
+    const [rawIssue, rawMeta, transitions] = await Promise.all([
+      jiraRequest(
+        connection,
+        "GET",
+        `${issuePath(key)}?fields=${["project", ...fieldIds.sprint, ...(fieldIds.extra ?? []).map((field) => field.id)].join(",")}`,
+      ),
+      jiraRequest(connection, "GET", `${issuePath(key)}/editmeta`),
+      fetchTransitions(connection, key),
+    ]);
+    const fields = nested(asRecord(rawIssue), "fields") ?? {};
+    const editable = nested(asRecord(rawMeta), "fields") ?? {};
+    const priorityMeta = asRecord(editable.priority);
+    const priorities = (Array.isArray(priorityMeta?.allowedValues) ? priorityMeta.allowedValues : [])
+      .map(asRecord)
+      .filter((value): value is Record<string, unknown> => value !== null && asString(value.id) !== "")
+      .map((value) => ({ id: asString(value.id), name: asString(value.name, "Priority") }));
+
+    const current = openSprintFrom(fields, fieldIds.sprint);
+    const project = asString(nested(fields, "project")?.key);
+    let boards: ProjectBoards = { boards: [], sprints: [] };
+    if (project !== "") {
+      try {
+        boards = await projectBoards(connection, project, sprintBoardIds(fields, fieldIds.sprint));
+      } catch (cause) {
+        bb.log.warn(`Could not list boards for ${project}: ${cause instanceof Error ? cause.message : String(cause)}`);
+      }
+    }
+    const sprintEditable = fieldIds.sprint.length > 0 && boards.boards.length > 0;
+    let sprintOptions = boards.sprints;
+    if (current !== null && !sprintOptions.some((sprint) => sprint.id === current.id)) {
+      sprintOptions = [current, ...sprintOptions];
+    }
+    const pointsEditable =
+      fieldIds.storyPoints.some((id) => id in editable) ||
+      (await boardEstimation(connection, key, boards.boards, fieldIds.storyPoints)) !== null;
+    return editOptionsSchema.parse({
+      transitions,
+      fields: (fieldIds.extra ?? []).flatMap((field) => {
+        const meta = asRecord(editable[field.id]);
+        if (meta === null || !Array.isArray(meta.allowedValues)) return [];
+        const options = meta.allowedValues
+          .map(asRecord)
+          .filter((option): option is Record<string, unknown> => option !== null && option.disabled !== true && asString(option.id) !== "")
+          .map((option) => ({ id: asString(option.id), name: asString(option.value, asString(option.name, "Option")) }));
+        const current = asRecord(fields[field.id]);
+        return [
+          {
+            id: field.id,
+            name: asString(meta.name, field.name),
+            required: meta.required === true,
+            value: current === null ? null : asString(current.id) || null,
+            options,
+          },
+        ];
+      }),
+      storyPoints: { editable: pointsEditable },
+      priority: { editable: "priority" in editable && priorities.length > 0, options: priorities },
+      sprint: { editable: sprintEditable, currentId: current?.id ?? null, options: sprintOptions },
+    });
+  }
+
+  /**
+   * Re-reads one issue after an edit and patches it into both cached lists,
+   * adding or dropping it as it now matches the board and sprint JQL.
+   */
+  async function syncIssue(connection: EditConnection, key: string): Promise<void> {
+    const current = await settings.get();
+    const fieldIds = await fieldIdsFor(connection);
+    const raw = await jiraRequest(
+      connection,
+      "GET",
+      `${issuePath(key)}?fields=${[...ISSUE_FIELDS, ...fieldIds.storyPoints, ...fieldIds.sprint].join(",")}`,
+    );
+    const issue = parseJiraIssue(raw, connection.siteUrl, fieldIds);
+    const id = asString(asRecord(raw)?.id);
+    const sprintsOn = current.sprintJql.trim() !== "" && fieldIds.sprint.length > 0;
+    const [inBoard, inSprint] = await Promise.all([
+      issueMatchesJql(connection, current.jql, key, id),
+      sprintsOn ? issueMatchesJql(connection, current.sprintJql, key, id) : Promise.resolve(false),
+    ]);
+    if ((inBoard || inSprint) && (await readComments(key)) === null) {
+      try {
+        await bb.storage.kv.set(
+          `${COMMENT_KEY_PREFIX}${key}`,
+          await fetchIssueComments(connection.siteUrl, key, connection.authorization),
+        );
+      } catch (cause) {
+        bb.log.warn(`Could not load comments for ${key}: ${cause instanceof Error ? cause.message : String(cause)}`);
+      }
+    }
+    const upsert = (list: JiraIssue[], keep: boolean) => {
+      const index = list.findIndex((candidate) => candidate.key === key);
+      if (!keep) return index < 0 ? list : list.filter((candidate) => candidate.key !== key);
+      if (index < 0) return [issue, ...list];
+      return list.map((candidate, position) => (position === index ? issue : candidate));
+    };
+    const patch = snapshotQueue.then(async () => {
+      const snapshot = await readSnapshot();
+      if (snapshot === null) return;
+      await writeSnapshot({
+        ...snapshot,
+        issues: upsert(snapshot.issues, inBoard),
+        sprintIssues: snapshot.sprints === "available" ? upsert(snapshot.sprintIssues, inSprint) : snapshot.sprintIssues,
+      });
+    });
+    snapshotQueue = patch.catch(() => undefined);
+    await patch;
+  }
+
+  async function transitionIssue(key: string, transitionId: string): Promise<void> {
+    const connection = await editConnection();
+    try {
+      await jiraRequest(connection, "POST", `${issuePath(key)}/transitions`, { transition: { id: transitionId } });
+    } catch (cause) {
+      // Name extra fields in workflow errors ("customfield_12158: ..." becomes "Capitalized: ...").
+      const extra = await fieldIdsFor(connection).then((ids) => ids.extra ?? [], () => []);
+      const message = extra.reduce(
+        (text, field) => text.split(field.id).join(field.name),
+        cause instanceof Error ? cause.message : String(cause),
+      );
+      throw new Error(message);
+    }
+    await syncIssue(connection, key);
+  }
+
+  async function updateIssue(update: IssueUpdate): Promise<void> {
+    const connection = await editConnection();
+    const { key } = update;
+    const extraUpdates = Object.entries(update.fields ?? {});
+    if (update.storyPoints !== undefined || update.priorityId !== undefined || extraUpdates.length > 0) {
+      const meta = nested(asRecord(await jiraRequest(connection, "GET", `${issuePath(key)}/editmeta`)), "fields") ?? {};
+      const fields: Record<string, unknown> = {};
+      let estimate: { boardId: number } | null = null;
+      if (update.storyPoints !== undefined) {
+        const pointFields = (await fieldIdsFor(connection)).storyPoints;
+        const fieldId = pointFields.find((id) => id in meta);
+        if (fieldId !== undefined) fields[fieldId] = update.storyPoints;
+        else {
+          // Not on the edit screen: estimate through a board, as Jira's own board does.
+          const sprintField = (await fieldIdsFor(connection)).sprint;
+          const issueFields =
+            nested(
+              asRecord(await jiraRequest(connection, "GET", `${issuePath(key)}?fields=${["project", ...sprintField].join(",")}`)),
+              "fields",
+            ) ?? {};
+          const project = asString(nested(issueFields, "project")?.key, key.slice(0, key.lastIndexOf("-")));
+          const { boards } = await projectBoards(connection, project, sprintBoardIds(issueFields, sprintField));
+          estimate = await boardEstimation(connection, key, boards, pointFields);
+          if (estimate === null) {
+            throw new Error(`Story points can't be edited on ${key}: the field isn't on its edit screen or estimated by a board.`);
+          }
+        }
+      }
+      if (update.priorityId !== undefined) {
+        if (!("priority" in meta)) throw new Error(`Priority can't be edited on ${key}.`);
+        fields.priority = { id: update.priorityId };
+      }
+      if (extraUpdates.length > 0) {
+        const extra = (await fieldIdsFor(connection)).extra ?? [];
+        for (const [fieldId, optionId] of extraUpdates) {
+          const field = extra.find((candidate) => candidate.id === fieldId);
+          if (field === undefined) throw new Error(`${fieldId} isn't in the Extra fields to edit setting.`);
+          if (!(fieldId in meta)) throw new Error(`${field.name} can't be edited on ${key}.`);
+          fields[fieldId] = optionId === null ? null : { id: optionId };
+        }
+      }
+      if (Object.keys(fields).length > 0) await jiraRequest(connection, "PUT", issuePath(key), { fields });
+      if (estimate !== null) {
+        await jiraRequest(
+          connection,
+          "PUT",
+          `/rest/agile/1.0/issue/${encodeURIComponent(key)}/estimation?boardId=${estimate.boardId}`,
+          { value: update.storyPoints === null ? "" : String(update.storyPoints) },
+        );
+      }
+    }
+    if (update.sprintId !== undefined) {
+      await jiraRequest(
+        connection,
+        "POST",
+        update.sprintId === null ? "/rest/agile/1.0/backlog/issue" : `/rest/agile/1.0/sprint/${update.sprintId}/issue`,
+        { issues: [key] },
+      );
+    }
+    await syncIssue(connection, key);
   }
 
   async function importIssues(
@@ -1160,6 +1764,18 @@ export default async function plugin(bb: BbPluginApi) {
     },
     board_refresh: async () => {
       await refreshBoard();
+      return formatState(await settings.get(), await readSnapshot());
+    },
+    issue_transitions_get: async ({ key }) => ({
+      transitions: await fetchTransitions(await editConnection(), key),
+    }),
+    issue_edit_options_get: async ({ key }) => editOptions(key),
+    issue_transition: async ({ key, transitionId }) => {
+      await transitionIssue(key, transitionId);
+      return formatState(await settings.get(), await readSnapshot());
+    },
+    issue_update: async (update) => {
+      await updateIssue(update);
       return formatState(await settings.get(), await readSnapshot());
     },
     issue_comments_get: async ({ key }) => {

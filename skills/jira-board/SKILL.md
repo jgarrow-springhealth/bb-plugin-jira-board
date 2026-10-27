@@ -91,6 +91,7 @@ bb jira-board export
 
 - Refresh is manual; no background schedule runs.
 - Never start Atlassian OAuth, call `auth-start`, open an authorization URL, request URL elicitation, or navigate a browser during refresh. If the existing Atlassian session is unavailable, stop and report the error.
-- Jira remains read-only. The page opens issues in Jira only after an explicit user click; refresh never opens Jira or OAuth pages.
+- Refresh never changes Jira or opens Jira or OAuth pages. The page opens issues in Jira only after an explicit user click.
+- With an API token and the `allowEditing` setting on (`editable: true` in `bb jira-board status --json`), the page can change Jira on an explicit user action: dragging a card to another column runs a workflow transition, and the details panel changes status, priority, story points, sprint, and the single-select fields named in `extraFields` (default `Capitalized`). Each change updates that issue in the cache in place. Agents should not change Jira through the plugin; they change Jira only when the user explicitly asks, with their own tools.
 - The details drawer can start a **work** thread (agent plans and begins the ticket) or a **chat** thread (opened from the user's own first message) in the project chosen in the plugin's settings, or a **Jira** project it creates on first use. Both receive the cached ticket details and comments as agent-only context and do not update Jira unless the user explicitly asks.
 - A failed refresh preserves and continues showing the last cached snapshot and comments.
