@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-jira-board",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Your assigned Jira work on a colorful kanban board, with one-click agent handoff.",
   "private": true,
   "license": "MIT",
