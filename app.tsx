@@ -69,8 +69,8 @@ const SPRINT_PHASES: Array<{ id: Phase; label: string; hint: string }> = [
   { id: "done", label: "Done", hint: "Finished this sprint" },
 ];
 const VIEWS: Array<{ id: ViewMode; label: string }> = [
-  { id: "board", label: "Board" },
   { id: "sprint", label: "Active sprint" },
+  { id: "board", label: "Board" },
   { id: "epics", label: "Epics" },
 ];
 const PHASE_COLORS: Record<Phase, string> = {
@@ -96,6 +96,7 @@ const PRIORITY_STYLE: Record<string, { icon: string; color: string }> = {
   Lowest: { icon: "ChevronsDown", color: "#3b82c4" },
 };
 const HIDDEN_PROJECTS_KEY = "jira-board.hidden-projects.v1";
+const VIEW_KEY = "jira-board.view.v1";
 const NO_EPIC = "__no_epic__";
 
 function tint(color: string, percent: number, base = "transparent"): string {
@@ -216,6 +217,23 @@ function shortDate(value: string): string {
     day: "numeric",
     ...(date.getFullYear() === new Date().getFullYear() ? {} : { year: "numeric" }),
   });
+}
+
+function readView(): ViewMode {
+  try {
+    const stored = window.localStorage.getItem(VIEW_KEY);
+    return stored === "board" || stored === "sprint" || stored === "epics" ? stored : "sprint";
+  } catch {
+    return "sprint";
+  }
+}
+
+function writeView(view: ViewMode) {
+  try {
+    window.localStorage.setItem(VIEW_KEY, view);
+  } catch {
+    // The active sprint still remains the default when storage is unavailable.
+  }
 }
 
 function readHiddenProjects(): Set<string> {
@@ -1109,13 +1127,75 @@ function SectionLabel({ id, children, count }: { id: string; children: ReactNode
   );
 }
 
+type AgentMode = "thread" | "springagent";
+const SPRING_AGENT_PROVIDER = "spring-agent";
+
+/** The chevron half of a split button: picks a regular BB thread or a Spring Agent thread. */
+function AgentModeMenu({
+  label,
+  primary = false,
+  disabled,
+  options,
+  onSelect,
+}: {
+  label: string;
+  /** Pairs with a primary button instead of an outline one. */
+  primary?: boolean;
+  disabled?: boolean;
+  options: Array<{ mode: AgentMode; title: string; detail: string }>;
+  onSelect: (mode: AgentMode) => void;
+}) {
+  const portalScope = usePortalScopeProps();
+  return (
+    <Popover.Root>
+      <Popover.Trigger asChild>
+        <Button
+          type="button"
+          variant={primary ? "default" : "outline"}
+          size="icon"
+          className={cn("size-8 w-6 rounded-l-none", primary ? "border-l border-background/25" : "border-l-0")}
+          disabled={disabled}
+          aria-label={label}
+        >
+          <Icon name="ChevronDown" className="size-3.5" />
+        </Button>
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Content
+          {...portalScope}
+          side="top"
+          sideOffset={6}
+          align="start"
+          aria-label={label}
+          className="z-50 w-72 rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md"
+        >
+          {options.map((option) => (
+            <Popover.Close asChild key={option.mode}>
+              <button
+                type="button"
+                onClick={() => onSelect(option.mode)}
+                className="flex w-full flex-col items-start gap-0.5 rounded px-2.5 py-2 text-left hover:bg-state-hover focus-visible:bg-state-hover focus-visible:outline-none"
+              >
+                <span className="text-[13px] font-medium">{option.title}</span>
+                <span className="text-xs text-muted-foreground">{option.detail}</span>
+              </button>
+            </Popover.Close>
+          ))}
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
+  );
+}
+
 function ChatDialog({
   issue,
   open,
+  mode,
   onOpenChange,
 }: {
   issue: JiraIssue;
   open: boolean;
+  mode: AgentMode;
   onOpenChange: (open: boolean) => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
@@ -1154,7 +1234,7 @@ function ChatDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Glyph name="chat" className="size-4 text-muted-foreground" />
-            Chat about {issue.key}
+            Chat about {issue.key}{mode === "springagent" ? " with a SpringAgent" : ""}
           </DialogTitle>
           <DialogDescription>
             Ask a question or talk it through. The agent gets the ticket and its comments as context, and won't
@@ -1167,7 +1247,9 @@ function ChatDialog({
           <div className="h-32 animate-pulse rounded-lg bg-muted/70" aria-label="Preparing the chat" />
         ) : (
           <NewThreadComposer
+            key={mode}
             defaultProjectId={projectId}
+            {...(mode === "springagent" ? { defaultProviderId: SPRING_AGENT_PROVIDER } : {})}
             draftKey={`jira-board.chat.${issue.key}`}
             placeholder={`What do you want to discuss about ${issue.key}?`}
             layout="document"
@@ -1615,7 +1697,20 @@ function IssueDrawer({
   const [commentsError, setCommentsError] = useState<string | null>(null);
   const [startingWork, setStartingWork] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
+  const [chatMode, setChatMode] = useState<AgentMode>("thread");
+  const [springAgent, setSpringAgent] = useState(false);
   const [stacks, setStacks] = useState<IssueStacks | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    void rpc.call("spring_agent_available").then(
+      (result) => active && setSpringAgent(result.available),
+      () => active && setSpringAgent(false),
+    );
+    return () => {
+      active = false;
+    };
+  }, [rpc]);
   const tags = [...new Set([...summary.labels, ...issue.labels])];
 
   useEffect(() => {
@@ -1671,10 +1766,15 @@ function IssueDrawer({
     }
   };
 
-  const startWork = async () => {
+  const openChat = (mode: AgentMode) => {
+    setChatMode(mode);
+    setChatOpen(true);
+  };
+
+  const startWork = async (mode: AgentMode = "thread") => {
     setStartingWork(true);
     try {
-      const result = await rpc.call("thread_start", { key: issue.key });
+      const result = await rpc.call("thread_start", { key: issue.key, mode });
       navigate.toThread(result.threadId);
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : String(cause));
@@ -1800,47 +1900,74 @@ function IssueDrawer({
       </div>
 
       <footer className="flex shrink-0 items-center gap-2 border-t border-border px-5 py-3">
-        <Button
-          type="button"
-          size="sm"
-          onClick={() => void startWork()}
-          disabled={startingWork}
-          aria-label="Start working on this ticket"
-        >
-          <Glyph name={startingWork ? "refresh" : "play"} className={cn("size-3.5", startingWork && "animate-spin")} />
-          {startingWork ? "Starting work" : "Start working"}
-        </Button>
-        <Tooltip.Provider delayDuration={250}>
-          <Tooltip.Root>
-            <Tooltip.Trigger asChild>
-              <Button
-                type="button"
-                variant="outline"
-                size="icon"
-                className="size-8"
-                onClick={() => setChatOpen(true)}
-                aria-label="Chat about this ticket"
-              >
-                <Glyph name="chat" className="size-4" />
-              </Button>
-            </Tooltip.Trigger>
-            <Tooltip.Portal>
-              <Tooltip.Content
-                side="top"
-                sideOffset={6}
-                className="z-50 rounded-md bg-foreground px-2 py-1 text-xs text-background shadow-md"
-              >
-                Chat about this ticket
-              </Tooltip.Content>
-            </Tooltip.Portal>
-          </Tooltip.Root>
-        </Tooltip.Provider>
+        <div className="flex">
+          <Button
+            type="button"
+            size="sm"
+            className={cn(springAgent && "rounded-r-none")}
+            onClick={() => void startWork("thread")}
+            disabled={startingWork}
+            aria-label="Start working on this ticket"
+          >
+            <Glyph name={startingWork ? "refresh" : "play"} className={cn("size-3.5", startingWork && "animate-spin")} />
+            {startingWork ? "Starting work" : "Start working"}
+          </Button>
+          {springAgent ? (
+            <AgentModeMenu
+              label="More ways to start work"
+              primary
+              disabled={startingWork}
+              onSelect={(mode) => void startWork(mode)}
+              options={[
+                { mode: "thread", title: "In a BB thread", detail: "An agent on this machine starts the work." },
+                { mode: "springagent", title: "With a SpringAgent", detail: "A SpringAgent in Stack Control starts the work; you follow it in BB." },
+              ]}
+            />
+          ) : null}
+        </div>
+        <div className="flex">
+          <Tooltip.Provider delayDuration={250}>
+            <Tooltip.Root>
+              <Tooltip.Trigger asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  className={cn("size-8", springAgent && "rounded-r-none")}
+                  onClick={() => openChat("thread")}
+                  aria-label="Chat about this ticket"
+                >
+                  <Glyph name="chat" className="size-4" />
+                </Button>
+              </Tooltip.Trigger>
+              <Tooltip.Portal>
+                <Tooltip.Content
+                  side="top"
+                  sideOffset={6}
+                  className="z-50 rounded-md bg-foreground px-2 py-1 text-xs text-background shadow-md"
+                >
+                  Chat about this ticket
+                </Tooltip.Content>
+              </Tooltip.Portal>
+            </Tooltip.Root>
+          </Tooltip.Provider>
+          {springAgent ? (
+            <AgentModeMenu
+              label="More ways to chat"
+              onSelect={openChat}
+              options={[
+                { mode: "thread", title: "In a BB thread", detail: "Chat with an agent on this machine." },
+                { mode: "springagent", title: "With a SpringAgent", detail: "Chat with a SpringAgent in Stack Control." },
+              ]}
+            />
+          ) : null}
+        </div>
         <Button type="button" variant="outline" size="sm" className="ml-auto" onClick={() => void navigate.openUrl(issue.url)}>
           <Icon name="ExternalLink" className="size-3.5" />
           Open in Jira
         </Button>
       </footer>
-      <ChatDialog issue={issue} open={chatOpen} onOpenChange={setChatOpen} />
+      <ChatDialog issue={issue} open={chatOpen} mode={chatMode} onOpenChange={setChatOpen} />
     </aside>
   );
 }
@@ -1966,7 +2093,7 @@ function JiraBoardPage() {
   const [state, setState] = useState<BoardState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
-  const [view, setView] = useState<ViewMode>("board");
+  const [view, setView] = useState<ViewMode>(readView);
   const [query, setQuery] = useState("");
   const [hiddenProjects, setHiddenProjectsState] = useState<Set<string>>(readHiddenProjects);
   const [sort, setSort] = useState<SortMode>("priority");
@@ -2007,6 +2134,7 @@ function JiraBoardPage() {
   useEffect(() => {
     void load();
   }, [load]);
+  useEffect(() => writeView(view), [view]);
   useRealtime("jira-issues-changed", () => void load());
 
   const refresh = useCallback(async () => {

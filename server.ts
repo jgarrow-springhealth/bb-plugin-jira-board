@@ -285,10 +285,15 @@ export const rpcContract = defineRpcContract({
     input: z.object({ key: z.string().max(40) }),
     output: issueStacksSchema,
   },
-  /** Hands the ticket to an agent to start working on it. */
+  /** Hands the ticket to an agent to start working on it: a regular BB thread, or a Spring Agent thread. */
   thread_start: {
-    input: z.object({ key: z.string() }),
+    input: z.object({ key: z.string(), mode: z.enum(["thread", "springagent"]).default("thread") }),
     output: z.object({ threadId: z.string(), projectId: z.string() }),
+  },
+  /** Whether the Spring Agent provider is installed, so the board can offer SpringAgent threads. */
+  spring_agent_available: {
+    input: z.null(),
+    output: z.object({ available: z.boolean() }),
   },
   /** Creates or reuses the Jira project so the chat composer can default to it. */
   jira_project_ensure: {
@@ -1784,6 +1789,16 @@ export default async function plugin(bb: BbPluginApi) {
     return { ...snapshot, issues: await withComments(snapshot.issues), sprintIssues: await withComments(snapshot.sprintIssues) };
   }
 
+  // The Spring Agent provider is optional too: "Start working" offers it only when it's installed.
+  const SPRING_AGENT_PROVIDER = "spring-agent";
+  async function springAgentAvailable(): Promise<boolean> {
+    try {
+      return (await bb.sdk.providers.list()).some((provider) => provider.id === SPRING_AGENT_PROVIDER);
+    } catch {
+      return false;
+    }
+  }
+
   // Stack Control is optional: the board never needs it, and shows the Test stack line only when it's installed
   // and enabled. The check is cached for a minute; when BB can't list plugins it falls back to trying the call,
   // which fails quietly without the plugin.
@@ -1843,12 +1858,17 @@ export default async function plugin(bb: BbPluginApi) {
         cached: comments !== null,
       };
     },
-    thread_start: async ({ key }) => {
+    spring_agent_available: async () => ({ available: await springAgentAvailable() }),
+    thread_start: async ({ key, mode }) => {
       const { issue, comments, title, titleSummary, pluginMetadata } = await issueForThread(key);
+      if (mode === "springagent" && !(await springAgentAvailable())) {
+        throw new Error("Install the Spring Agent plugin to start work with a SpringAgent.");
+      }
       const projectId = await ensureJiraProject();
       const thread = await bb.sdk.threads.spawn({
         projectId,
         environment: { type: "project-default" },
+        ...(mode === "springagent" ? { providerId: SPRING_AGENT_PROVIDER } : {}),
         title,
         input: [
           { type: "text", text: `Start working on ${issue.key}: ${titleSummary}`, mentions: [] },

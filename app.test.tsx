@@ -56,7 +56,10 @@ const otherIssues = [
   },
 ];
 
-beforeEach(() => window.localStorage.clear());
+beforeEach(() => {
+  window.localStorage.clear();
+  window.localStorage.setItem("jira-board.view.v1", "board");
+});
 
 describe("Jira Board page", () => {
   it("filters by any combination of projects from a compact picker", async () => {
@@ -198,9 +201,39 @@ describe("Jira Board page", () => {
     await slot.findByText("Starting work");
     expect(slot.rpcCalls).toContainEqual({
       method: "thread_start",
-      input: { key: "ACME-1" },
+      input: { key: "ACME-1", mode: "thread" },
     });
     expect(slot.navigateCalls).toContainEqual({ method: "toThread", threadId: "jira-thread" });
+    expect(slot.queryByRole("button", { name: "More ways to start work" })).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("offers a SpringAgent for starting work and chatting when the provider is installed", async () => {
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, {
+      rpc: {
+        board_get: () => boardState([issue]),
+        issue_comments_get: () => ({ cached: true, comments: [] }),
+        spring_agent_available: () => ({ available: true }),
+        jira_project_ensure: () => ({ projectId: "jira-project" }),
+        thread_start: () => ({ threadId: "spring-thread", projectId: "jira-project" }),
+      },
+    });
+
+    fireEvent.click(await slot.findByText("Ship the focused Jira board"));
+    fireEvent.click(await slot.findByRole("button", { name: "More ways to chat" }));
+    fireEvent.click(await screen.findByText("With a SpringAgent"));
+    expect(await screen.findByText("Chat about ACME-1 with a SpringAgent")).toBeTruthy();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+
+    fireEvent.click(await slot.findByRole("button", { name: "More ways to start work" }));
+    fireEvent.click(await screen.findByText("With a SpringAgent"));
+    await slot.findByText("Starting work");
+    expect(slot.rpcCalls).toContainEqual({
+      method: "thread_start",
+      input: { key: "ACME-1", mode: "springagent" },
+    });
+    expect(slot.navigateCalls).toContainEqual({ method: "toThread", threadId: "spring-thread" });
     slot.lifecycle.unmount();
   });
 
@@ -280,7 +313,8 @@ describe("Jira Board page", () => {
     slot.lifecycle.unmount();
   });
 
-  it("shows the active sprint with a Done column and progress", async () => {
+  it("defaults to the active sprint with a Done column and progress", async () => {
+    window.localStorage.removeItem("jira-board.view.v1");
     const sprint = {
       id: "42",
       name: "Platform 24",
@@ -306,7 +340,8 @@ describe("Jira Board page", () => {
         issue_comments_get: () => ({ cached: true, comments: [] }),
       },
     });
-    fireEvent.click(await slot.findByRole("button", { name: "Active sprint" }));
+    const activeSprint = await slot.findByRole("button", { name: "Active sprint" });
+    expect(activeSprint.getAttribute("aria-pressed")).toBe("true");
     const header = slot.getByRole("banner", { name: "Sprint Platform 24" });
     expect(within(header).getByText(/Ship checkout/)).toBeTruthy();
     expect(header.textContent).toContain("5 of 8 points done");

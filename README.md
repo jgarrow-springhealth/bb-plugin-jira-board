@@ -11,15 +11,16 @@ from the details panel.
 
 ## What you get
 
+- **Active sprint view** (the default, first tab). Your tickets in the sprint that's running now,
+  including finished ones in a **Done** column, with the sprint's dates, days
+  left, goal, and a points-based progress bar. If you're in more than one
+  active sprint, switch between them at the top. The page opens on the last
+  view you used, or on this one the first time.
 - **Board view.** Your exact Jira statuses are grouped into four equal
   columns: **Queue** (not started), **Blocked** (needs unblocking), **Active**
   (in motion), and **Review** (waiting on others). Each card shows a colored
   project tag, the exact status, story points, priority, epic, and how long
   since it changed.
-- **Active sprint view.** Your tickets in the sprint that's running now,
-  including finished ones in a **Done** column, with the sprint's dates, days
-  left, goal, and a points-based progress bar. If you're in more than one
-  active sprint, switch between them at the top.
 - **Epics view.** Every epic with a small progress bar. Pick one to see its
   tickets in the same four columns.
 - **Project filter.** A compact multi-select picker, remembered between visits.
@@ -39,10 +40,14 @@ from the details panel.
   such as **Capitalized**.
 - **Start working.** Hands the ticket to an agent in BB. The thread opens with a
   short "Start working on KEY" message; the agent privately receives the ticket,
-  its comments, and instructions to plan and begin the work.
+  its comments, and instructions to plan and begin the work. With the Spring
+  Agent plugin installed, the arrow beside the button also offers **With a
+  SpringAgent**, which starts the same work in a Spring Agent thread.
 - **Chat about this ticket.** The chat icon opens BB's composer. Nothing is sent
   until you write your own first message; the agent gets the ticket as hidden
-  context and is told not to start working or change Jira unless you ask.
+  context and is told not to start working or change Jira unless you ask. With
+  the Spring Agent plugin installed, the arrow beside it opens the composer with
+  Spring Agent already picked.
 - **Manual refresh** through the Atlassian MCP connection BB already has, or an
   optional Jira API token. A failed refresh never clears the last good board.
 
